@@ -2,8 +2,9 @@
 
 ## Project Structure & Module Organization
 
-This is a Rust 2024 library crate. `src/lib.rs` defines the public surface and
-re-exports types from focused private modules:
+This is a Rust 2024 workspace. The root package is the renderer-independent
+`seamless_tiler` library; `src/lib.rs` defines its public surface and re-exports
+types from focused private modules:
 
 - `spatial.rs`: coordinates, extents, and rectangles.
 - `grid.rs`: owned row-major rectangular storage.
@@ -11,28 +12,42 @@ re-exports types from focused private modules:
 - `transform.rs`: square rotations and reflections (`D4`).
 - `tile.rs`: sockets, tiles, stable IDs, and matching policies.
 
+The `ui/` workspace member is the native `seamless_tiler_ui` binary. Its
+`src/main.rs` configures eframe with the wgpu renderer, while `src/app.rs` owns
+the editor model, egui controls, canvas painting, and focused model tests.
+
 Unit tests live beside their implementation in `#[cfg(test)]` modules. Crate-level
-examples are doctests in `src/lib.rs`. There are currently no runtime assets or
-binary target; place future integration tests in `tests/` and binaries in
-`src/bin/`.
+examples are doctests in `src/lib.rs`. There are currently no runtime assets;
+place future library integration tests in `tests/` and keep UI-only code inside
+the `ui` package.
 
 ## Architecture Overview
 
 Keep storage independent from topology: `Grid<T>` owns rectangular values, while
 algorithms should use `Topology` and dense `CellId` values for adjacency. Keep the
 core renderer-independent and avoid adding image, UI, or solver concerns to these
-foundational modules without a demonstrated shared abstraction.
+foundational modules without a demonstrated shared abstraction. The UI may
+depend on the library, but the library must not depend on eframe, egui, wgpu, or
+UI-specific payloads. Keep the native UI session-only unless persistence or a
+project format is explicitly designed.
 
 ## Build, Test, and Development Commands
 
-- `cargo build`: compile the library in development mode.
-- `cargo test --all-targets`: run all unit and target tests.
-- `cargo test --doc`: compile and run public documentation examples.
+- `cargo build --workspace`: compile the library and UI in development mode.
+- `cargo run -p seamless_tiler_ui`: launch the native grid editor with wgpu.
+- `cargo test --workspace --all-targets`: run all library and UI tests.
+- `cargo test --workspace --doc`: compile and run public documentation examples.
 - `cargo fmt --all -- --check`: verify standard Rust formatting.
-- `cargo clippy --all-targets -- -D warnings`: enforce lint-clean code.
-- `cargo doc --no-deps`: build local API documentation.
+- `cargo clippy --workspace --all-targets -- -D warnings`: enforce lint-clean
+  code.
+- `cargo doc --workspace --no-deps`: build local API documentation.
 
-Run formatting, tests, and Clippy before submitting changes.
+Run formatting, tests, and Clippy before submitting changes. Manage dependencies
+with Cargo commands such as `cargo add` and `cargo remove`, preferring the latest
+compatible release unless the repository has a documented compatibility reason
+to pin an older version. Keep eframe configured without default features and
+explicitly enable `default_fonts`, `wgpu`, `x11`, and `wayland`; do not add a glow
+fallback without a demonstrated need.
 
 ## Coding Style & Naming Conventions
 
@@ -48,7 +63,10 @@ Use Rust's built-in test framework. Name tests as behavioral statements, such as
 `axes_wrap_independently`. Cover normal behavior, invalid inputs, empty or
 degenerate dimensions, overflow, and algebraic laws. Every public example must
 remain a passing doctest. No coverage percentage is mandated, but new behavior
-must have focused regression tests.
+must have focused regression tests. Keep UI state transitions in testable model
+methods where practical; manually smoke-test native window creation, painting,
+erasing, resizing, orientation controls, and bounded/wrapped topology changes
+after altering interactive behavior.
 
 ## Commit & Pull Request Guidelines
 
