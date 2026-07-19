@@ -385,6 +385,7 @@ impl<T: Topology> Wfc<T> {
     fn propagate_from(&mut self, cells: impl IntoIterator<Item = CellId>) -> usize {
         let mut queue: VecDeque<_> = cells.into_iter().collect();
         let mut removed = 0;
+        let mut unsupported = Vec::new();
 
         while let Some(source) = queue.pop_front() {
             if self.domains[source.index()].len == 0 {
@@ -395,7 +396,7 @@ impl<T: Topology> Wfc<T> {
                 let Some(neighbor) = self.topology.neighbor(source, direction) else {
                     continue;
                 };
-                let mut unsupported = Vec::new();
+                unsupported.clear();
                 for neighbor_index in 0..self.rules.pattern_count() {
                     let neighbor_pattern = PatternId::new(neighbor_index);
                     if !self.domains[neighbor.index()].contains(neighbor_pattern) {

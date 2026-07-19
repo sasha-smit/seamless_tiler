@@ -519,7 +519,7 @@ impl TilerApp {
             let center = cell_center(mode, canvas, coord, self.cell_size);
             match visual {
                 CellVisual::Contradiction => {
-                    let radius = cell_radius(mode, self.cell_size) * 0.55;
+                    let radius = self.cell_size * 0.5 * 0.55;
                     painter.line_segment(
                         [
                             center + Vec2::new(-radius, -radius),
@@ -548,7 +548,7 @@ impl TilerApp {
                     paint_sockets(
                         painter,
                         center,
-                        cell_radius(mode, self.cell_size),
+                        self.cell_size * 0.5,
                         mode,
                         self.model.variant_sockets(variant),
                     );
@@ -738,13 +738,6 @@ fn cell_center(mode: GridMode, canvas: Rect, coord: Coord2, cell_size: f32) -> P
                     cell_size * (0.5 + coord.y as f32 * 0.75),
                 )
         }
-    }
-}
-
-fn cell_radius(mode: GridMode, cell_size: f32) -> f32 {
-    match mode {
-        GridMode::Square => cell_size * 0.5,
-        GridMode::Hex => cell_size * 0.5,
     }
 }
 

@@ -192,6 +192,18 @@ impl fmt::Display for TopologyError {
 
 impl Error for TopologyError {}
 
+/// Validates that an extent has a representable area and signed coordinates, returning its
+/// cell count.
+fn validated_cell_count(extent: Extent2) -> Result<usize, TopologyError> {
+    let cell_count = extent
+        .checked_area()
+        .ok_or(TopologyError::CellCountOverflow { extent })?;
+    if extent.width > i32::MAX as usize + 1 || extent.height > i32::MAX as usize + 1 {
+        return Err(TopologyError::CoordinateRangeExceeded { extent });
+    }
+    Ok(cell_count)
+}
+
 /// A four-neighbor rectangular square lattice.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SquareTopology {
@@ -202,12 +214,7 @@ pub struct SquareTopology {
 
 impl SquareTopology {
     pub fn new(extent: Extent2, boundaries: AxisBoundaries) -> Result<Self, TopologyError> {
-        let cell_count = extent
-            .checked_area()
-            .ok_or(TopologyError::CellCountOverflow { extent })?;
-        if extent.width > i32::MAX as usize + 1 || extent.height > i32::MAX as usize + 1 {
-            return Err(TopologyError::CoordinateRangeExceeded { extent });
-        }
+        let cell_count = validated_cell_count(extent)?;
         Ok(Self {
             extent,
             boundaries,
@@ -291,12 +298,7 @@ pub struct HexTopology {
 
 impl HexTopology {
     pub fn new(extent: Extent2, boundaries: AxisBoundaries) -> Result<Self, TopologyError> {
-        let cell_count = extent
-            .checked_area()
-            .ok_or(TopologyError::CellCountOverflow { extent })?;
-        if extent.width > i32::MAX as usize + 1 || extent.height > i32::MAX as usize + 1 {
-            return Err(TopologyError::CoordinateRangeExceeded { extent });
-        }
+        let cell_count = validated_cell_count(extent)?;
         Ok(Self {
             extent,
             boundaries,
@@ -459,6 +461,24 @@ mod tests {
     }
 
     #[test]
+    fn square_offsets_agree_with_bounded_neighbors() {
+        let topology = SquareTopology::bounded(Extent2::new(4, 3)).unwrap();
+        for index in 0..topology.cell_count() {
+            let id = CellId::new(index);
+            let coord = topology.coordinate(id).unwrap();
+            for direction in SquareDirection::ALL.iter().copied() {
+                let offset = direction.offset();
+                let shifted = Coord2::new(coord.x + offset.x, coord.y + offset.y);
+                assert_eq!(
+                    topology.neighbor(id, direction),
+                    topology.cell_at(shifted),
+                    "{coord:?} {direction:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn coordinates_and_ids_round_trip() {
         let topology = SquareTopology::bounded(Extent2::new(4, 3)).unwrap();
         for index in 0..topology.cell_count() {
@@ -565,6 +585,24 @@ mod tests {
         assert_eq!(topology.cell_count(), 0);
         assert_eq!(topology.cell_at(Coord2::ZERO), None);
         assert_eq!(topology.neighbor(CellId::new(0), HexDirection::East), None);
+    }
+
+    #[test]
+    fn hex_offsets_agree_with_bounded_neighbors() {
+        let topology = HexTopology::bounded(Extent2::new(4, 5)).unwrap();
+        for index in 0..topology.cell_count() {
+            let id = CellId::new(index);
+            let coord = topology.coordinate(id).unwrap();
+            for direction in HexDirection::ALL.iter().copied() {
+                let offset = direction.offset(coord.y);
+                let shifted = Coord2::new(coord.x + offset.x, coord.y + offset.y);
+                assert_eq!(
+                    topology.neighbor(id, direction),
+                    topology.cell_at(shifted),
+                    "{coord:?} {direction:?}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -162,17 +162,12 @@ impl ModeSpec for HexMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct TileVariant<T> {
-    placement: OrientedTileId<T>,
-}
-
 struct Session<M: ModeSpec> {
     pins: Grid<Option<usize>>,
     topology: M::Topology,
     boundaries: AxisBoundaries,
     tiles: TileSet<TileStyle, M::Direction, bool>,
-    variants: Vec<TileVariant<M::Transform>>,
+    variants: Vec<OrientedTileId<M::Transform>>,
     variant_sockets: Vec<Vec<bool>>,
     enabled: Vec<bool>,
     pattern_variants: Vec<usize>,
@@ -396,7 +391,10 @@ impl<M: ModeSpec> Session<M> {
             return 0;
         };
         (0..self.topology.cell_count())
-            .filter(|index| wave.candidate_count(CellId::new(*index)) > Some(1))
+            .filter(|index| {
+                wave.candidate_count(CellId::new(*index))
+                    .is_some_and(|candidates| candidates > 1)
+            })
             .count()
     }
 
@@ -457,15 +455,15 @@ impl<M: ModeSpec> Session<M> {
 
         let mut enabled_per_tile = vec![0_usize; self.tiles.len()];
         for variant_index in &self.pattern_variants {
-            enabled_per_tile[self.variants[*variant_index].placement.tile.index()] += 1;
+            enabled_per_tile[self.variants[*variant_index].tile.index()] += 1;
         }
         let weights = self.pattern_variants.iter().map(|variant_index| {
-            let tile = self.variants[*variant_index].placement.tile;
+            let tile = self.variants[*variant_index].tile;
             1.0 / enabled_per_tile[tile.index()] as f64
         });
         let rules = WfcRules::new(weights, |direction, source, neighbor| {
-            let source = self.variants[self.pattern_variants[source.index()]].placement;
-            let neighbor = self.variants[self.pattern_variants[neighbor.index()]].placement;
+            let source = self.variants[self.pattern_variants[source.index()]];
+            let neighbor = self.variants[self.pattern_variants[neighbor.index()]];
             let source_tile = self
                 .tiles
                 .get(source.tile)
@@ -485,7 +483,7 @@ impl<M: ModeSpec> Session<M> {
         let topology = self.topology;
         let wave = Wfc::with_constraints(topology, rules, self.seed, |cell, pattern| {
             let variant_index = self.pattern_variants[pattern.index()];
-            let variant = self.variants[variant_index].placement;
+            let variant = self.variants[variant_index];
             let tile = self
                 .tiles
                 .get(variant.tile)
@@ -506,7 +504,7 @@ impl<M: ModeSpec> Session<M> {
 
 fn distinct_variants<M: ModeSpec>(
     tiles: &TileSet<TileStyle, M::Direction, bool>,
-) -> (Vec<TileVariant<M::Transform>>, Vec<Vec<bool>>) {
+) -> (Vec<OrientedTileId<M::Transform>>, Vec<Vec<bool>>) {
     let mut variants = Vec::new();
     let mut sockets = Vec::new();
     for (tile_id, tile) in tiles.iter() {
@@ -521,9 +519,7 @@ fn distinct_variants<M: ModeSpec>(
                 continue;
             }
             signatures.push(signature.clone());
-            variants.push(TileVariant {
-                placement: OrientedTileId::new(tile_id, transform),
-            });
+            variants.push(OrientedTileId::new(tile_id, transform));
             sockets.push(signature);
         }
     }
@@ -598,7 +594,7 @@ impl<M: ModeSpec> SessionAccess for Session<M> {
         self.tiles.get(tile).map(|value| value.payload)
     }
     fn variant(&self, index: usize) -> Option<VariantView> {
-        let placement = self.variants.get(index)?.placement;
+        let placement = *self.variants.get(index)?;
         Some(VariantView {
             tile: placement.tile,
             orientation: M::orientation(placement.transform),
@@ -614,7 +610,7 @@ impl<M: ModeSpec> SessionAccess for Session<M> {
         self.variants
             .iter()
             .enumerate()
-            .filter_map(|(index, variant)| (variant.placement.tile == tile).then_some(index))
+            .filter_map(|(index, variant)| (variant.tile == tile).then_some(index))
             .collect()
     }
     fn enabled_variant_count(&self) -> usize {
@@ -921,7 +917,7 @@ mod tests {
         let wave = session.wave.as_ref().unwrap();
         let mut totals = vec![0.0; session.tiles.len()];
         for (pattern_index, variant_index) in session.pattern_variants.iter().copied().enumerate() {
-            let tile = session.variants[variant_index].placement.tile;
+            let tile = session.variants[variant_index].tile;
             totals[tile.index()] += wave.rules().weight(PatternId::new(pattern_index)).unwrap();
         }
         for total in totals {
