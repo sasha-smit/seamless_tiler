@@ -1,15 +1,16 @@
-//! Renderer-independent foundations for experimenting with two-dimensional tiling.
+//! Renderer-independent foundations and Wave Function Collapse for two-dimensional tiling.
 //!
 //! The crate deliberately separates rectangular storage ([`Grid`]) from neighborhood
 //! relationships ([`Topology`]). This lets algorithms use dense [`CellId`] values while
-//! concrete topologies retain whatever coordinate system suits them.
+//! concrete topologies retain whatever coordinate system suits them. [`Wfc`] operates on
+//! topology cells and dense pattern IDs without owning application payloads or rendering data.
 //!
 //! # Example
 //!
 //! ```
 //! use seamless_tiler::{
-//!     AxisBoundaries, Boundary, Coord2, Extent2, SocketMap, SquareDirection,
-//!     SquareTopology, Tile, TileSet, Topology,
+//!     AxisBoundaries, Boundary, Coord2, Extent2, PatternId, SocketMap, SquareDirection,
+//!     SquareTopology, Tile, TileSet, Topology, Wfc, WfcRules, WfcStatus,
 //! };
 //!
 //! let mut tiles = TileSet::new();
@@ -34,6 +35,14 @@
 //!     cylinder.coordinate(cylinder.neighbor(left, SquareDirection::West).unwrap()),
 //!     Some(Coord2::new(2, 0)),
 //! );
+//!
+//! let rules = WfcRules::new([1.0, 1.0], |_direction, source, neighbor| {
+//!     source == neighbor
+//! }).unwrap();
+//! let wave = Wfc::with_constraints(bounded, rules, 7, |cell, pattern| {
+//!     cell != left || pattern == PatternId::new(0)
+//! });
+//! assert_eq!(wave.status(), WfcStatus::Solved);
 //! # Ok::<(), seamless_tiler::TopologyError>(())
 //! ```
 
@@ -42,6 +51,7 @@ mod spatial;
 mod tile;
 mod topology;
 mod transform;
+mod wfc;
 
 pub use grid::{Grid, GridError};
 pub use spatial::{Coord2, Extent2, Rect};
@@ -51,3 +61,4 @@ pub use topology::{
     TopologyError,
 };
 pub use transform::{D4, QuarterTurns};
+pub use wfc::{PatternId, Wfc, WfcError, WfcRules, WfcStatus, WfcStep};

@@ -1,147 +1,28 @@
-use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
+use std::time::Duration;
+
+use eframe::egui::{
+    self, Align2, Color32, FontId, PointerButton, Pos2, Rect, RichText, Sense, Stroke, StrokeKind,
+    Vec2,
+};
 use seamless_tiler::{
-    AxisBoundaries, Boundary, Coord2, D4, Direction, Extent2, Grid, OrientedTileId, QuarterTurns,
-    SocketMap, SquareDirection, SquareTopology, Tile, TileId, TileSet, Topology,
+    AxisBoundaries, Boundary, Coord2, D4, Direction, Extent2, QuarterTurns, SquareDirection, Tile,
+    Topology, WfcStatus,
 };
 
-const DEFAULT_EXTENT: Extent2 = Extent2::new(12, 8);
-const MAX_DIMENSION: usize = 64;
+use crate::model::{CanvasTool, CellVisual, DEFAULT_EXTENT, EditorModel, MAX_DIMENSION, TileStyle};
+
 const DEFAULT_CELL_SIZE: f32 = 52.0;
-
-type Placement = OrientedTileId<D4>;
-type DemoTileSet = TileSet<TileStyle, SquareDirection, bool>;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct TileStyle {
-    name: &'static str,
-    color: [u8; 3],
-}
-
-impl TileStyle {
-    fn color32(self) -> Color32 {
-        Color32::from_rgb(self.color[0], self.color[1], self.color[2])
-    }
-}
-
-struct EditorModel {
-    grid: Grid<Option<Placement>>,
-    topology: SquareTopology,
-    tiles: DemoTileSet,
-    selected_tile: TileId,
-    selected_transform: D4,
-    selected_cell: Option<Coord2>,
-}
-
-impl Default for EditorModel {
-    fn default() -> Self {
-        Self::new(DEFAULT_EXTENT)
-    }
-}
-
-impl EditorModel {
-    fn new(extent: Extent2) -> Self {
-        assert!(
-            Self::valid_extent(extent),
-            "editor extent must be between 1 and 64"
-        );
-        let tiles = demo_tiles();
-        Self {
-            grid: Grid::filled(extent, None).expect("editor dimensions have a valid area"),
-            topology: SquareTopology::bounded(extent)
-                .expect("editor dimensions fit signed coordinates"),
-            tiles,
-            selected_tile: TileId::new(0),
-            selected_transform: D4::IDENTITY,
-            selected_cell: None,
-        }
-    }
-
-    fn valid_extent(extent: Extent2) -> bool {
-        (1..=MAX_DIMENSION).contains(&extent.width) && (1..=MAX_DIMENSION).contains(&extent.height)
-    }
-
-    fn extent(&self) -> Extent2 {
-        self.grid.extent()
-    }
-
-    fn boundaries(&self) -> AxisBoundaries {
-        self.topology.boundaries()
-    }
-
-    fn paint(&mut self, coord: Coord2) -> bool {
-        let placement = Placement::new(self.selected_tile, self.selected_transform);
-        let Some(cell) = self.grid.get_mut(coord) else {
-            return false;
-        };
-        *cell = Some(placement);
-        self.selected_cell = Some(coord);
-        true
-    }
-
-    fn erase(&mut self, coord: Coord2) -> bool {
-        let Some(cell) = self.grid.get_mut(coord) else {
-            return false;
-        };
-        *cell = None;
-        self.selected_cell = Some(coord);
-        true
-    }
-
-    fn resize(&mut self, extent: Extent2) -> bool {
-        if !Self::valid_extent(extent) {
-            return false;
-        }
-
-        let mut resized = Grid::filled(extent, None).expect("editor dimensions have a valid area");
-        for (coord, placement) in self.grid.cells() {
-            if let Some(target) = resized.get_mut(coord) {
-                *target = *placement;
-            }
-        }
-
-        self.grid = resized;
-        self.topology = SquareTopology::new(extent, self.boundaries())
-            .expect("editor dimensions fit signed coordinates");
-        if self
-            .selected_cell
-            .is_some_and(|coord| !extent.contains(coord))
-        {
-            self.selected_cell = None;
-        }
-        true
-    }
-
-    fn set_boundaries(&mut self, boundaries: AxisBoundaries) {
-        self.topology = SquareTopology::new(self.extent(), boundaries)
-            .expect("existing editor dimensions fit signed coordinates");
-    }
-
-    fn clear(&mut self) {
-        for cell in &mut self.grid {
-            *cell = None;
-        }
-    }
-
-    fn reset(&mut self) {
-        *self = Self::default();
-    }
-
-    fn rotate_clockwise(&mut self) {
-        let clockwise = D4::new(QuarterTurns::One, false);
-        self.selected_transform = clockwise.compose(self.selected_transform);
-    }
-
-    fn reflect_horizontally(&mut self) {
-        let reflection = D4::new(QuarterTurns::Zero, true);
-        self.selected_transform = reflection.compose(self.selected_transform);
-    }
-}
+const DEFAULT_STEPS_PER_SECOND: f32 = 8.0;
 
 pub struct TilerApp {
     model: EditorModel,
     width_input: usize,
     height_input: usize,
     cell_size: f32,
+    steps_per_second: f32,
+    last_frame_time: f64,
+    step_accumulator: f64,
+    notice: Option<String>,
 }
 
 impl Default for TilerApp {
@@ -151,35 +32,75 @@ impl Default for TilerApp {
             width_input: DEFAULT_EXTENT.width,
             height_input: DEFAULT_EXTENT.height,
             cell_size: DEFAULT_CELL_SIZE,
+            steps_per_second: DEFAULT_STEPS_PER_SECOND,
+            last_frame_time: 0.0,
+            step_accumulator: 0.0,
+            notice: None,
         }
     }
 }
 
 impl eframe::App for TilerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.advance_playback(ui);
+
         egui::Panel::top("instructions").show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
-                ui.heading("Seamless Tiler");
+                ui.heading("WFC Tiler");
                 ui.separator();
-                ui.label("Left-drag to paint · Right-drag to erase · Select a cell to inspect its topology");
+                ui.label(
+                    "Choose allowed orientations, pin exact tiles where needed, then Step or Run",
+                );
+                ui.separator();
+                ui.weak("Right-drag always unpins");
             });
         });
 
         egui::Panel::left("controls")
-            .default_size(250.0)
-            .resizable(false)
+            .default_size(300.0)
+            .resizable(true)
             .show(ui, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| self.show_controls(ui));
             });
 
-        egui::CentralPanel::default().show(ui, |ui| {
-            self.show_canvas(ui);
-        });
+        egui::CentralPanel::default().show(ui, |ui| self.show_canvas(ui));
     }
 }
 
 impl TilerApp {
+    fn advance_playback(&mut self, ui: &egui::Ui) {
+        let now = ui.input(|input| input.time);
+        let elapsed = (now - self.last_frame_time).clamp(0.0, 0.25);
+        self.last_frame_time = now;
+
+        if !self.model.running() {
+            self.step_accumulator = 0.0;
+            return;
+        }
+        self.step_accumulator += elapsed * f64::from(self.steps_per_second);
+        let steps = self.step_accumulator.floor().min(64.0) as usize;
+        self.step_accumulator -= steps as f64;
+        for _ in 0..steps {
+            if !self.model.step() {
+                break;
+            }
+        }
+        ui.ctx().request_repaint_after(Duration::from_millis(16));
+    }
+
     fn show_controls(&mut self, ui: &mut egui::Ui) {
+        self.show_grid_controls(ui);
+        ui.separator();
+        self.show_topology_controls(ui);
+        ui.separator();
+        self.show_solver_controls(ui);
+        ui.separator();
+        self.show_variant_palette(ui);
+        ui.separator();
+        self.show_inspector(ui);
+    }
+
+    fn show_grid_controls(&mut self, ui: &mut egui::Ui) {
         ui.heading("Grid");
         egui::Grid::new("dimensions").show(ui, |ui| {
             ui.label("Width");
@@ -189,27 +110,28 @@ impl TilerApp {
             ui.add(egui::DragValue::new(&mut self.height_input).range(1..=MAX_DIMENSION));
             ui.end_row();
         });
-
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui.button("Apply size").clicked() {
                 self.model
                     .resize(Extent2::new(self.width_input, self.height_input));
             }
-            if ui.button("Clear").clicked() {
-                self.model.clear();
+            if ui.button("Clear pins").clicked() {
+                let cleared = self.model.clear_pins();
+                self.notice = Some(format!("Cleared {cleared} pin(s)"));
             }
             if ui.button("Reset all").clicked() {
-                self.model.reset();
+                self.model.reset_all();
                 self.width_input = DEFAULT_EXTENT.width;
                 self.height_input = DEFAULT_EXTENT.height;
                 self.cell_size = DEFAULT_CELL_SIZE;
+                self.steps_per_second = DEFAULT_STEPS_PER_SECOND;
+                self.notice = Some("Restored defaults".to_owned());
             }
         });
-
-        ui.add_space(6.0);
         ui.add(egui::Slider::new(&mut self.cell_size, 28.0..=80.0).text("Cell size"));
+    }
 
-        ui.separator();
+    fn show_topology_controls(&mut self, ui: &mut egui::Ui) {
         ui.heading("Topology");
         let current = self.model.boundaries();
         let mut horizontal = current.horizontal;
@@ -220,52 +142,217 @@ impl TilerApp {
         if boundaries != current {
             self.model.set_boundaries(boundaries);
         }
+        ui.weak("Bounded edges close outward-facing path sockets.");
+    }
 
-        ui.separator();
-        ui.heading("Tile palette");
-        let mut chosen_tile = None;
-        for (id, tile) in self.model.tiles.iter() {
-            let selected = self.model.selected_tile == id;
-            let button = egui::Button::new(tile.payload.name)
-                .fill(tile.payload.color32())
-                .selected(selected)
-                .min_size(Vec2::new(ui.available_width(), 28.0));
-            if ui.add(button).clicked() {
-                chosen_tile = Some(id);
-            }
-        }
-        if let Some(id) = chosen_tile {
-            self.model.selected_tile = id;
-        }
-
-        ui.add_space(6.0);
+    fn show_solver_controls(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Wave Function Collapse");
+        let mut seed = self.model.seed();
         ui.horizontal(|ui| {
-            if ui.button("Rotate ↻").clicked() {
-                self.model.rotate_clockwise();
-            }
-            if ui.button("Reflect ↔").clicked() {
-                self.model.reflect_horizontally();
+            ui.label("Seed");
+            if ui.add(egui::DragValue::new(&mut seed).speed(1.0)).changed() {
+                self.model.set_seed(seed);
             }
         });
-        ui.label(format!(
-            "Orientation: {}",
-            transform_label(self.model.selected_transform)
-        ));
 
-        ui.separator();
-        self.show_inspector(ui);
+        let running = matches!(self.model.status(), Some(WfcStatus::Running));
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Reset").clicked() {
+                self.model.reset_wave();
+            }
+            if ui.add_enabled(running, egui::Button::new("Step")).clicked() {
+                self.model.step();
+            }
+            let run_label = if self.model.running() { "Pause" } else { "Run" };
+            if ui
+                .add_enabled(running, egui::Button::new(run_label))
+                .clicked()
+            {
+                self.model.toggle_running();
+            }
+            if ui
+                .add_enabled(running, egui::Button::new("Finish"))
+                .clicked()
+            {
+                self.model.finish();
+            }
+            let can_retry = matches!(self.model.status(), Some(WfcStatus::Contradiction { .. }))
+                && !self.model.initial_contradiction();
+            if ui
+                .add_enabled(can_retry, egui::Button::new("Retry seed +1"))
+                .clicked()
+            {
+                self.model.retry();
+            }
+        });
+        ui.add(
+            egui::Slider::new(&mut self.steps_per_second, 1.0..=60.0)
+                .logarithmic(true)
+                .text("Steps / second"),
+        );
+
+        self.show_status(ui);
+        if let Some(notice) = &self.notice {
+            ui.weak(notice);
+        }
+    }
+
+    fn show_status(&self, ui: &mut egui::Ui) {
+        let (color, text) = match self.model.status() {
+            None => (
+                Color32::from_rgb(240, 180, 70),
+                "Enable at least one tile orientation".to_owned(),
+            ),
+            Some(WfcStatus::Running) => (
+                Color32::from_rgb(100, 190, 255),
+                format!(
+                    "{} unresolved · {} observations",
+                    self.model.unresolved_count(),
+                    self.model.observations()
+                ),
+            ),
+            Some(WfcStatus::Solved) => (
+                Color32::from_rgb(100, 220, 130),
+                format!("Solved in {} observations", self.model.observations()),
+            ),
+            Some(WfcStatus::Contradiction { cell }) if self.model.initial_contradiction() => (
+                Color32::from_rgb(255, 105, 105),
+                format!(
+                    "Constraints conflict at cell {} · change pins or allowed tiles",
+                    cell.index()
+                ),
+            ),
+            Some(WfcStatus::Contradiction { cell }) => (
+                Color32::from_rgb(255, 105, 105),
+                format!("Contradiction at cell {} · retry or reset", cell.index()),
+            ),
+        };
+        ui.colored_label(color, text);
+    }
+
+    fn show_variant_palette(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Tile orientations");
+        ui.horizontal_wrapped(|ui| {
+            let inspect = self.model.tool() == CanvasTool::Inspect;
+            if ui.selectable_label(inspect, "Inspect").clicked() {
+                self.model.set_tool(CanvasTool::Inspect);
+            }
+            let unpin = self.model.tool() == CanvasTool::Unpin;
+            if ui.selectable_label(unpin, "Unpin").clicked() {
+                self.model.set_tool(CanvasTool::Unpin);
+            }
+        });
+        ui.weak("Checkbox: allowed globally · Preview: exact pin brush");
+
+        let groups: Vec<_> = self
+            .model
+            .tiles()
+            .iter()
+            .map(|(tile_id, tile)| {
+                (
+                    tile_id,
+                    tile.payload,
+                    self.model.variants_for_tile(tile_id).collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        for (_tile_id, style, variant_indices) in groups {
+            ui.add_space(5.0);
+            ui.label(RichText::new(style.name).strong().color(style_color(style)));
+            ui.horizontal_wrapped(|ui| {
+                for variant_index in variant_indices {
+                    let mut enabled = self.model.variant_enabled(variant_index);
+                    ui.vertical(|ui| {
+                        if ui.checkbox(&mut enabled, "Allowed").changed() {
+                            let cleared = self.model.set_variant_enabled(variant_index, enabled);
+                            if cleared > 0 {
+                                self.notice = Some(format!(
+                                    "Disabled orientation and cleared {cleared} matching pin(s)"
+                                ));
+                            }
+                        }
+                        let response = self.paint_variant_preview(ui, variant_index, enabled);
+                        if response.clicked() && enabled {
+                            self.model.set_tool(CanvasTool::Pin(variant_index));
+                        }
+                        let transform = self.model.variants()[variant_index].placement.transform;
+                        ui.label(RichText::new(transform_label(transform)).small());
+                    });
+                }
+            });
+        }
+        ui.weak(format!(
+            "{} distinct orientations enabled",
+            self.model.enabled_variant_count()
+        ));
+    }
+
+    fn paint_variant_preview(
+        &self,
+        ui: &mut egui::Ui,
+        variant_index: usize,
+        enabled: bool,
+    ) -> egui::Response {
+        let variant = self.model.variants()[variant_index];
+        let tile = self
+            .model
+            .tiles()
+            .get(variant.placement.tile)
+            .expect("variant refers to a demo tile");
+        let (rect, response) = ui.allocate_exact_size(Vec2::splat(48.0), Sense::click());
+        let selected = self.model.tool() == CanvasTool::Pin(variant_index);
+        let fill = if enabled {
+            style_color(tile.payload)
+        } else {
+            Color32::from_gray(42)
+        };
+        ui.painter().rect_filled(rect, 5.0, fill);
+        ui.painter().rect_stroke(
+            rect,
+            5.0,
+            Stroke::new(
+                if selected { 3.0 } else { 1.0 },
+                if selected {
+                    Color32::WHITE
+                } else {
+                    Color32::from_gray(100)
+                },
+            ),
+            StrokeKind::Inside,
+        );
+        if enabled {
+            paint_tile_sockets(
+                ui.painter(),
+                rect.shrink(2.0),
+                tile,
+                variant.placement.transform,
+            );
+        } else {
+            ui.painter().line_segment(
+                [rect.left_top(), rect.right_bottom()],
+                Stroke::new(2.0, Color32::from_rgb(190, 90, 90)),
+            );
+        }
+        response.on_hover_text(if enabled {
+            format!(
+                "Select {} {} as the pin brush",
+                tile.payload.name,
+                transform_label(variant.placement.transform)
+            )
+        } else {
+            "Enable this orientation before pinning it".to_owned()
+        })
     }
 
     fn show_inspector(&self, ui: &mut egui::Ui) {
         ui.heading("Inspector");
-        let Some(coord) = self.model.selected_cell else {
-            ui.label("Select a cell to see its contents and neighbors.");
+        let Some(coord) = self.model.selected_cell() else {
+            ui.label("Inspect or edit a cell to see its current wave domain.");
             return;
         };
-
         let cell = self
             .model
-            .topology
+            .topology()
             .cell_at(coord)
             .expect("selected coordinates are in bounds");
         ui.monospace(format!(
@@ -275,59 +362,71 @@ impl TilerApp {
             cell.index()
         ));
 
-        match self.model.grid[coord] {
-            Some(placement) => {
+        if let Some(pin) = self.model.pin_at(coord) {
+            let tile = self
+                .model
+                .tiles()
+                .get(pin.tile)
+                .expect("pins refer to demo tiles");
+            ui.colored_label(
+                Color32::from_rgb(255, 205, 80),
+                format!(
+                    "Pinned: {} · {}",
+                    tile.payload.name,
+                    transform_label(pin.transform)
+                ),
+            );
+        } else {
+            ui.weak("Not pinned");
+        }
+
+        match self.model.cell_visual(coord) {
+            CellVisual::Unavailable => {
+                ui.weak("No candidates: enable at least one orientation.");
+            }
+            CellVisual::Contradiction => {
+                ui.colored_label(
+                    Color32::from_rgb(255, 105, 105),
+                    "Contradiction: 0 candidates",
+                );
+            }
+            CellVisual::Collapsed { variant, .. } => {
+                let placement = self.model.variants()[variant].placement;
                 let tile = self
                     .model
-                    .tiles
+                    .tiles()
                     .get(placement.tile)
-                    .expect("placements refer to demo tiles");
+                    .expect("variant refers to a demo tile");
                 ui.label(format!(
-                    "{} · {}",
+                    "Collapsed: {} · {}",
                     tile.payload.name,
                     transform_label(placement.transform)
                 ));
+            }
+            CellVisual::Superposition {
+                candidates,
+                entropy,
+            } => {
+                ui.label(format!("{candidates} candidates · entropy {entropy:.3}"));
                 ui.horizontal_wrapped(|ui| {
-                    ui.label("Sockets:");
-                    for direction in SquareDirection::ALL {
-                        let open = tile.oriented_socket(placement.transform, *direction);
+                    for variant_index in self.model.candidate_variants(coord) {
+                        let placement = self.model.variants()[variant_index].placement;
+                        let tile = self
+                            .model
+                            .tiles()
+                            .get(placement.tile)
+                            .expect("variant refers to a demo tile");
                         ui.colored_label(
-                            if *open {
-                                direction_color(*direction)
-                            } else {
-                                Color32::GRAY
-                            },
+                            style_color(tile.payload),
                             format!(
-                                "{}: {}",
-                                direction_short(*direction),
-                                if *open { "open" } else { "closed" }
+                                "{} {}",
+                                tile.payload.name,
+                                transform_label(placement.transform)
                             ),
                         );
                     }
                 });
             }
-            None => {
-                ui.weak("Empty");
-            }
-        }
-
-        ui.add_space(4.0);
-        for direction in SquareDirection::ALL {
-            let neighbor = self.model.topology.neighbor(cell, *direction);
-            let text = match neighbor.and_then(|id| self.model.topology.coordinate(id)) {
-                Some(neighbor_coord) => {
-                    let wrap = is_wrapped_neighbor(coord, neighbor_coord, *direction);
-                    format!(
-                        "{} -> ({}, {}){}",
-                        direction_short(*direction),
-                        neighbor_coord.x,
-                        neighbor_coord.y,
-                        if wrap { " · wrap" } else { "" }
-                    )
-                }
-                None => format!("{} -> boundary", direction_short(*direction)),
-            };
-            ui.colored_label(direction_color(*direction), text);
         }
     }
 
@@ -348,13 +447,16 @@ impl TilerApp {
                     && let Some(pointer) = response.hover_pos()
                     && let Some(coord) = pointer_coordinate(canvas, pointer, self.cell_size, extent)
                 {
-                    let (paint, erase) = ui.input(|input| {
-                        (input.pointer.primary_down(), input.pointer.secondary_down())
+                    let (primary, secondary) = ui.input(|input| {
+                        (
+                            input.pointer.button_down(PointerButton::Primary),
+                            input.pointer.button_down(PointerButton::Secondary),
+                        )
                     });
-                    if erase {
-                        self.model.erase(coord);
-                    } else if paint {
-                        self.model.paint(coord);
+                    if secondary {
+                        self.model.apply_tool(coord, true);
+                    } else if primary {
+                        self.model.apply_tool(coord, false);
                     }
                 }
 
@@ -363,111 +465,110 @@ impl TilerApp {
     }
 
     fn paint_grid(&self, painter: &egui::Painter, canvas: Rect) {
-        for (coord, placement) in self.model.grid.cells() {
+        let total_candidates = self.model.enabled_variant_count().max(1);
+        for index in 0..self.model.topology().cell_count() {
+            let cell = seamless_tiler::CellId::new(index);
+            let coord = self
+                .model
+                .topology()
+                .coordinate(cell)
+                .expect("topology cells have coordinates");
             let rect = cell_rect(canvas, coord, self.cell_size).shrink(1.0);
-            let fill = placement
-                .and_then(|placement| self.model.tiles.get(placement.tile))
-                .map_or(Color32::from_gray(32), |tile| tile.payload.color32());
+            let visual = self.model.cell_visual(coord);
+            let fill = match visual {
+                CellVisual::Unavailable => Color32::from_gray(28),
+                CellVisual::Contradiction => Color32::from_rgb(135, 35, 45),
+                CellVisual::Superposition { candidates, .. } => {
+                    uncertainty_color(candidates, total_candidates)
+                }
+                CellVisual::Collapsed { variant, .. } => {
+                    let tile = self
+                        .model
+                        .tiles()
+                        .get(self.model.variants()[variant].placement.tile)
+                        .expect("variant refers to a demo tile");
+                    style_color(tile.payload)
+                }
+            };
             painter.rect_filled(rect, 3.0, fill);
             painter.rect_stroke(
                 rect,
                 3.0,
-                Stroke::new(1.0, Color32::from_gray(80)),
+                Stroke::new(1.0, Color32::from_gray(82)),
                 StrokeKind::Inside,
             );
-            painter.text(
-                rect.left_top() + Vec2::splat(4.0),
-                Align2::LEFT_TOP,
-                format!("{},{}", coord.x, coord.y),
-                FontId::monospace(9.0),
-                Color32::from_white_alpha(150),
+
+            match visual {
+                CellVisual::Contradiction => {
+                    painter.line_segment(
+                        [
+                            rect.left_top() + Vec2::splat(7.0),
+                            rect.right_bottom() - Vec2::splat(7.0),
+                        ],
+                        Stroke::new(3.0, Color32::from_rgb(255, 150, 150)),
+                    );
+                    painter.line_segment(
+                        [
+                            Pos2::new(rect.right() - 7.0, rect.top() + 7.0),
+                            Pos2::new(rect.left() + 7.0, rect.bottom() - 7.0),
+                        ],
+                        Stroke::new(3.0, Color32::from_rgb(255, 150, 150)),
+                    );
+                }
+                CellVisual::Superposition { candidates, .. } => {
+                    painter.text(
+                        rect.center(),
+                        Align2::CENTER_CENTER,
+                        candidates,
+                        FontId::monospace((self.cell_size * 0.25).clamp(10.0, 18.0)),
+                        Color32::from_white_alpha(220),
+                    );
+                }
+                CellVisual::Collapsed { variant, pinned } => {
+                    let placement = self.model.variants()[variant].placement;
+                    let tile = self
+                        .model
+                        .tiles()
+                        .get(placement.tile)
+                        .expect("variant refers to a demo tile");
+                    paint_tile_sockets(painter, rect, tile, placement.transform);
+                    if pinned {
+                        painter.circle_filled(
+                            rect.right_top() + Vec2::new(-8.0, 8.0),
+                            7.0,
+                            Color32::from_rgb(255, 205, 80),
+                        );
+                        painter.text(
+                            rect.right_top() + Vec2::new(-8.0, 8.0),
+                            Align2::CENTER_CENTER,
+                            "P",
+                            FontId::monospace(8.0),
+                            Color32::BLACK,
+                        );
+                    }
+                }
+                CellVisual::Unavailable => {}
+            }
+
+            if self.model.last_observed() == Some(coord) {
+                painter.rect_stroke(
+                    rect.shrink(2.0),
+                    3.0,
+                    Stroke::new(2.0, Color32::from_rgb(90, 220, 255)),
+                    StrokeKind::Inside,
+                );
+            }
+        }
+
+        if let Some(selected) = self.model.selected_cell() {
+            painter.rect_stroke(
+                cell_rect(canvas, selected, self.cell_size).shrink(2.0),
+                3.0,
+                Stroke::new(3.0, Color32::WHITE),
+                StrokeKind::Inside,
             );
-
-            if let Some(placement) = placement
-                && let Some(tile) = self.model.tiles.get(placement.tile)
-            {
-                paint_tile_sockets(painter, rect, tile, placement.transform);
-            }
-        }
-
-        if let Some(selected) = self.model.selected_cell {
-            self.paint_topology_overlay(painter, canvas, selected);
         }
     }
-
-    fn paint_topology_overlay(&self, painter: &egui::Painter, canvas: Rect, selected: Coord2) {
-        let selected_rect = cell_rect(canvas, selected, self.cell_size).shrink(2.0);
-        painter.rect_stroke(
-            selected_rect,
-            3.0,
-            Stroke::new(3.0, Color32::WHITE),
-            StrokeKind::Inside,
-        );
-
-        let cell = self
-            .model
-            .topology
-            .cell_at(selected)
-            .expect("selected coordinates are in bounds");
-        for direction in SquareDirection::ALL {
-            let color = direction_color(*direction);
-            let Some(neighbor) = self.model.topology.neighbor(cell, *direction) else {
-                paint_boundary_marker(painter, selected_rect, *direction, color, "boundary");
-                continue;
-            };
-            let neighbor_coord = self
-                .model
-                .topology
-                .coordinate(neighbor)
-                .expect("neighbor IDs belong to this topology");
-            let neighbor_rect = cell_rect(canvas, neighbor_coord, self.cell_size).shrink(3.0);
-            paint_neighbor_badge(painter, neighbor_rect, *direction, color);
-
-            if is_wrapped_neighbor(selected, neighbor_coord, *direction) {
-                paint_boundary_marker(painter, selected_rect, *direction, color, "wrap");
-                paint_boundary_marker(
-                    painter,
-                    neighbor_rect,
-                    direction.opposite(),
-                    color,
-                    direction_short(*direction),
-                );
-            } else {
-                painter.line_segment(
-                    [selected_rect.center(), neighbor_rect.center()],
-                    Stroke::new(2.0, color),
-                );
-            }
-        }
-    }
-}
-
-fn demo_tiles() -> DemoTileSet {
-    let mut tiles = TileSet::with_capacity(5);
-    insert_demo_tile(&mut tiles, "Blank", [72, 79, 89], |_| false);
-    insert_demo_tile(&mut tiles, "Straight", [55, 118, 171], |direction| {
-        matches!(direction, SquareDirection::North | SquareDirection::South)
-    });
-    insert_demo_tile(&mut tiles, "Corner", [46, 139, 87], |direction| {
-        matches!(direction, SquareDirection::North | SquareDirection::East)
-    });
-    insert_demo_tile(&mut tiles, "T junction", [157, 112, 40], |direction| {
-        direction != SquareDirection::South
-    });
-    insert_demo_tile(&mut tiles, "Cross", [135, 80, 156], |_| true);
-    tiles
-}
-
-fn insert_demo_tile(
-    tiles: &mut DemoTileSet,
-    name: &'static str,
-    color: [u8; 3],
-    socket: impl FnMut(SquareDirection) -> bool,
-) -> TileId {
-    tiles.insert(Tile::new(
-        TileStyle { name, color },
-        SocketMap::from_fn(socket),
-    ))
 }
 
 fn boundary_selector(ui: &mut egui::Ui, label: &str, boundary: &mut Boundary) {
@@ -486,37 +587,29 @@ fn transform_label(transform: D4) -> String {
         QuarterTurns::Three => "270°",
     };
     if transform.is_reflected() {
-        format!("{rotation}, reflected")
+        format!("{rotation} reflected")
     } else {
         rotation.to_owned()
     }
 }
 
-fn direction_short(direction: SquareDirection) -> &'static str {
-    match direction {
-        SquareDirection::North => "N",
-        SquareDirection::East => "E",
-        SquareDirection::South => "S",
-        SquareDirection::West => "W",
-    }
+fn style_color(style: TileStyle) -> Color32 {
+    Color32::from_rgb(style.color[0], style.color[1], style.color[2])
 }
 
-fn direction_color(direction: SquareDirection) -> Color32 {
-    match direction {
-        SquareDirection::North => Color32::from_rgb(80, 170, 255),
-        SquareDirection::East => Color32::from_rgb(255, 180, 65),
-        SquareDirection::South => Color32::from_rgb(90, 215, 120),
-        SquareDirection::West => Color32::from_rgb(230, 100, 160),
-    }
-}
-
-fn direction_vector(direction: SquareDirection) -> Vec2 {
-    match direction {
-        SquareDirection::North => Vec2::new(0.0, -1.0),
-        SquareDirection::East => Vec2::new(1.0, 0.0),
-        SquareDirection::South => Vec2::new(0.0, 1.0),
-        SquareDirection::West => Vec2::new(-1.0, 0.0),
-    }
+fn uncertainty_color(candidates: usize, total: usize) -> Color32 {
+    let t = if total <= 1 {
+        0.0
+    } else {
+        (candidates.saturating_sub(1) as f32 / (total - 1) as f32).clamp(0.0, 1.0)
+    };
+    let low = [105.0, 72.0, 42.0];
+    let high = [38.0, 48.0, 76.0];
+    Color32::from_rgb(
+        (low[0] + (high[0] - low[0]) * t) as u8,
+        (low[1] + (high[1] - low[1]) * t) as u8,
+        (low[2] + (high[2] - low[2]) * t) as u8,
+    )
 }
 
 fn pointer_coordinate(
@@ -538,10 +631,13 @@ fn cell_rect(canvas: Rect, coord: Coord2, cell_size: f32) -> Rect {
     Rect::from_min_size(min, Vec2::splat(cell_size))
 }
 
-fn is_wrapped_neighbor(source: Coord2, neighbor: Coord2, direction: SquareDirection) -> bool {
-    let offset = direction.offset();
-    source.x.checked_add(offset.x) != Some(neighbor.x)
-        || source.y.checked_add(offset.y) != Some(neighbor.y)
+fn direction_vector(direction: SquareDirection) -> Vec2 {
+    match direction {
+        SquareDirection::North => Vec2::new(0.0, -1.0),
+        SquareDirection::East => Vec2::new(1.0, 0.0),
+        SquareDirection::South => Vec2::new(0.0, 1.0),
+        SquareDirection::West => Vec2::new(-1.0, 0.0),
+    }
 }
 
 fn paint_tile_sockets(
@@ -558,51 +654,12 @@ fn paint_tile_sockets(
         let vector = direction_vector(*direction);
         let start = center + vector * (rect.width() * 0.12);
         let end = center + vector * (rect.width() * 0.46);
-        painter.line_segment([start, end], Stroke::new(5.0, Color32::WHITE));
+        painter.line_segment(
+            [start, end],
+            Stroke::new((rect.width() * 0.1).clamp(3.0, 6.0), Color32::WHITE),
+        );
     }
     painter.circle_filled(center, rect.width() * 0.09, Color32::WHITE);
-}
-
-fn paint_neighbor_badge(
-    painter: &egui::Painter,
-    rect: Rect,
-    direction: SquareDirection,
-    color: Color32,
-) {
-    let position = rect.center() + direction_vector(direction) * (rect.width() * 0.2);
-    painter.circle_filled(position, 9.0, color);
-    painter.text(
-        position,
-        Align2::CENTER_CENTER,
-        direction_short(direction),
-        FontId::monospace(9.0),
-        Color32::BLACK,
-    );
-}
-
-fn paint_boundary_marker(
-    painter: &egui::Painter,
-    rect: Rect,
-    direction: SquareDirection,
-    color: Color32,
-    label: &str,
-) {
-    let vector = direction_vector(direction);
-    let edge = rect.center() + vector * (rect.width() * 0.48);
-    let inner = edge - vector * 12.0;
-    painter.line_segment([inner, edge], Stroke::new(4.0, color));
-    painter.text(
-        inner - vector * 3.0,
-        match direction {
-            SquareDirection::North => Align2::CENTER_BOTTOM,
-            SquareDirection::East => Align2::RIGHT_CENTER,
-            SquareDirection::South => Align2::CENTER_TOP,
-            SquareDirection::West => Align2::LEFT_CENTER,
-        },
-        label,
-        FontId::monospace(8.0),
-        color,
-    );
 }
 
 #[cfg(test)]
@@ -610,76 +667,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn painting_and_erasing_use_the_selected_orientation() {
-        let mut model = EditorModel::new(Extent2::new(3, 2));
-        model.selected_tile = TileId::new(2);
-        model.rotate_clockwise();
-        model.reflect_horizontally();
-        let expected = Placement::new(model.selected_tile, model.selected_transform);
-
-        assert!(model.paint(Coord2::new(1, 1)));
-        assert_eq!(model.grid[Coord2::new(1, 1)], Some(expected));
-        assert_eq!(model.selected_cell, Some(Coord2::new(1, 1)));
-
-        assert!(model.erase(Coord2::new(1, 1)));
-        assert_eq!(model.grid[Coord2::new(1, 1)], None);
-        assert!(!model.paint(Coord2::new(3, 1)));
+    fn pointer_coordinates_respect_canvas_bounds() {
+        let canvas = Rect::from_min_size(Pos2::new(10.0, 20.0), Vec2::new(100.0, 50.0));
+        let extent = Extent2::new(2, 1);
+        assert_eq!(
+            pointer_coordinate(canvas, Pos2::new(75.0, 30.0), 50.0, extent),
+            Some(Coord2::new(1, 0))
+        );
+        assert_eq!(
+            pointer_coordinate(canvas, Pos2::new(110.0, 30.0), 50.0, extent),
+            None
+        );
     }
 
     #[test]
-    fn resizing_preserves_overlap_and_drops_outside_selection() {
-        let mut model = EditorModel::new(Extent2::new(3, 3));
-        model.paint(Coord2::new(0, 0));
-        let retained = model.grid[Coord2::new(0, 0)];
-        model.paint(Coord2::new(2, 2));
-
-        assert!(model.resize(Extent2::new(2, 2)));
-        assert_eq!(model.grid[Coord2::new(0, 0)], retained);
-        assert_eq!(model.grid.len(), 4);
-        assert_eq!(model.selected_cell, None);
-        assert!(!model.resize(Extent2::new(0, 2)));
+    fn uncertainty_colors_distinguish_small_and_large_domains() {
+        assert_ne!(uncertainty_color(2, 12), uncertainty_color(12, 12));
     }
 
     #[test]
-    fn changing_boundaries_keeps_grid_contents_and_changes_neighbors() {
-        let mut model = EditorModel::new(Extent2::new(3, 2));
-        model.paint(Coord2::new(0, 0));
-        let placement = model.grid[Coord2::new(0, 0)];
-        let left = model.topology.cell_at(Coord2::new(0, 0)).unwrap();
-        assert_eq!(model.topology.neighbor(left, SquareDirection::West), None);
-
-        model.set_boundaries(AxisBoundaries::new(Boundary::Wrap, Boundary::Bounded));
-
-        let neighbor = model
-            .topology
-            .neighbor(left, SquareDirection::West)
-            .and_then(|cell| model.topology.coordinate(cell));
-        assert_eq!(neighbor, Some(Coord2::new(2, 0)));
-        assert_eq!(model.grid[Coord2::new(0, 0)], placement);
-    }
-
-    #[test]
-    fn one_cell_torus_reports_four_wrapped_self_neighbors() {
-        let mut model = EditorModel::new(Extent2::new(1, 1));
-        model.set_boundaries(AxisBoundaries::TOROIDAL);
-        let only = model.topology.cell_at(Coord2::ZERO).unwrap();
-
-        for direction in SquareDirection::ALL {
-            let neighbor = model.topology.neighbor(only, *direction).unwrap();
-            let coord = model.topology.coordinate(neighbor).unwrap();
-            assert_eq!(coord, Coord2::ZERO);
-            assert!(is_wrapped_neighbor(Coord2::ZERO, coord, *direction));
-        }
-    }
-
-    #[test]
-    fn demo_tiles_expose_oriented_sockets() {
-        let model = EditorModel::default();
-        let corner = model.tiles.get(TileId::new(2)).unwrap();
-        let clockwise = D4::new(QuarterTurns::One, false);
-
-        assert!(*corner.oriented_socket(clockwise, SquareDirection::East));
-        assert!(*corner.oriented_socket(clockwise, SquareDirection::South));
-        assert!(!*corner.oriented_socket(clockwise, SquareDirection::North));
+    fn transform_labels_include_reflection() {
+        assert_eq!(transform_label(D4::IDENTITY), "0°");
+        assert_eq!(
+            transform_label(D4::new(QuarterTurns::One, true)),
+            "90° reflected"
+        );
     }
 }

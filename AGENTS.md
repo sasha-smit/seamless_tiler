@@ -11,10 +11,13 @@ types from focused private modules:
 - `topology.rs`: generic neighborhood traits and square topology.
 - `transform.rs`: square rotations and reflections (`D4`).
 - `tile.rs`: sockets, tiles, stable IDs, and matching policies.
+- `wfc.rs`: weighted compatibility rules, wave domains, observation, and
+  constraint propagation over generic topologies.
 
 The `ui/` workspace member is the native `seamless_tiler_ui` binary. Its
-`src/main.rs` configures eframe with the wgpu renderer, while `src/app.rs` owns
-the editor model, egui controls, canvas painting, and focused model tests.
+`src/main.rs` configures eframe with the wgpu renderer, `src/model.rs` owns the
+session-only WFC configuration and tile adapter, and `src/app.rs` owns egui
+controls and canvas painting.
 
 Unit tests live beside their implementation in `#[cfg(test)]` modules. Crate-level
 examples are doctests in `src/lib.rs`. There are currently no runtime assets;
@@ -25,16 +28,18 @@ the `ui` package.
 
 Keep storage independent from topology: `Grid<T>` owns rectangular values, while
 algorithms should use `Topology` and dense `CellId` values for adjacency. Keep the
-core renderer-independent and avoid adding image, UI, or solver concerns to these
-foundational modules without a demonstrated shared abstraction. The UI may
-depend on the library, but the library must not depend on eframe, egui, wgpu, or
-UI-specific payloads. Keep the native UI session-only unless persistence or a
+core renderer-independent and avoid adding image or UI concerns to foundational
+modules. WFC operates on dense `PatternId` domains and compatibility rules; it
+must not own tile payloads or rendering data. The UI maps patterns to oriented
+tiles and applies demo-specific policies such as closed bounded edges. The UI
+may depend on the library, but the library must not depend on eframe, egui, wgpu,
+or UI-specific payloads. Keep the native UI session-only unless persistence or a
 project format is explicitly designed.
 
 ## Build, Test, and Development Commands
 
 - `cargo build --workspace`: compile the library and UI in development mode.
-- `cargo run -p seamless_tiler_ui`: launch the native grid editor with wgpu.
+- `cargo run -p seamless_tiler_ui`: launch the native WFC visualizer with wgpu.
 - `cargo test --workspace --all-targets`: run all library and UI tests.
 - `cargo test --workspace --doc`: compile and run public documentation examples.
 - `cargo fmt --all -- --check`: verify standard Rust formatting.
@@ -56,6 +61,8 @@ Use `rustfmt` defaults (four-space indentation). Follow Rust naming conventions:
 `SCREAMING_SNAKE_CASE` for constants. Prefer small, domain-focused modules,
 checked arithmetic at coordinate boundaries, explicit error types, and rustdoc
 for public behavior or invariants. Re-export intended public APIs from `lib.rs`.
+Keep seeded solver behavior deterministic, validate public rule inputs, and
+handle wrapped self-neighbors as unary constraints during propagation.
 
 ## Testing Guidelines
 
@@ -64,9 +71,10 @@ Use Rust's built-in test framework. Name tests as behavioral statements, such as
 degenerate dimensions, overflow, and algebraic laws. Every public example must
 remain a passing doctest. No coverage percentage is mandated, but new behavior
 must have focused regression tests. Keep UI state transitions in testable model
-methods where practical; manually smoke-test native window creation, painting,
-erasing, resizing, orientation controls, and bounded/wrapped topology changes
-after altering interactive behavior.
+methods rather than egui callbacks where practical. Manually smoke-test native
+window creation, allowed-orientation toggles, inspect/pin/unpin tools, resizing,
+bounded and wrapped topology, seed reset and retry, and step/run/pause/finish
+playback after altering interactive behavior.
 
 ## Commit & Pull Request Guidelines
 
