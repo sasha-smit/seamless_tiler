@@ -1,23 +1,26 @@
+use std::f32::consts::PI;
 use std::time::Duration;
 
 use eframe::egui::{
-    self, Align2, Color32, FontId, PointerButton, Pos2, Rect, RichText, Sense, Stroke, StrokeKind,
-    Vec2,
+    self, Align2, Color32, FontId, PointerButton, Pos2, Rect, RichText, Sense, Shape, Stroke,
+    StrokeKind, Vec2,
 };
 use seamless_tiler::{
-    AxisBoundaries, Boundary, Coord2, D4, Direction, Extent2, QuarterTurns, SquareDirection, Tile,
-    Topology, WfcStatus,
+    AxisBoundaries, Boundary, CellId, Coord2, Extent2, QuarterTurns, SixthTurns, WfcStatus,
 };
 
-use crate::model::{CanvasTool, CellVisual, DEFAULT_EXTENT, EditorModel, MAX_DIMENSION, TileStyle};
+use crate::model::{
+    CanvasTool, CellVisual, DEFAULT_EXTENT, EditorModel, GridMode, MAX_DIMENSION, Orientation,
+    TileStyle,
+};
 
 const DEFAULT_CELL_SIZE: f32 = 52.0;
 const DEFAULT_STEPS_PER_SECOND: f32 = 8.0;
+const SQRT_3: f32 = 1.732_050_8;
 
 pub struct TilerApp {
     model: EditorModel,
-    width_input: usize,
-    height_input: usize,
+    dimension_inputs: [Extent2; 2],
     cell_size: f32,
     steps_per_second: f32,
     last_frame_time: f64,
@@ -29,8 +32,7 @@ impl Default for TilerApp {
     fn default() -> Self {
         Self {
             model: EditorModel::default(),
-            width_input: DEFAULT_EXTENT.width,
-            height_input: DEFAULT_EXTENT.height,
+            dimension_inputs: [DEFAULT_EXTENT; 2],
             cell_size: DEFAULT_CELL_SIZE,
             steps_per_second: DEFAULT_STEPS_PER_SECOND,
             last_frame_time: 0.0,
@@ -102,30 +104,41 @@ impl TilerApp {
 
     fn show_grid_controls(&mut self, ui: &mut egui::Ui) {
         ui.heading("Grid");
+        let mut mode = self.model.mode();
+        ui.horizontal(|ui| {
+            ui.label("Cells");
+            for candidate in GridMode::ALL {
+                ui.selectable_value(&mut mode, candidate, candidate.label());
+            }
+        });
+        if self.model.set_mode(mode) {
+            self.dimension_inputs[mode.index()] = self.model.extent();
+            self.step_accumulator = 0.0;
+            self.last_frame_time = ui.input(|input| input.time);
+            self.notice = Some(format!("Switched to {} grid", mode.label()));
+        }
+
+        let dimensions = &mut self.dimension_inputs[mode.index()];
         egui::Grid::new("dimensions").show(ui, |ui| {
             ui.label("Width");
-            ui.add(egui::DragValue::new(&mut self.width_input).range(1..=MAX_DIMENSION));
+            ui.add(egui::DragValue::new(&mut dimensions.width).range(1..=MAX_DIMENSION));
             ui.end_row();
             ui.label("Height");
-            ui.add(egui::DragValue::new(&mut self.height_input).range(1..=MAX_DIMENSION));
+            ui.add(egui::DragValue::new(&mut dimensions.height).range(1..=MAX_DIMENSION));
             ui.end_row();
         });
         ui.horizontal_wrapped(|ui| {
             if ui.button("Apply size").clicked() {
-                self.model
-                    .resize(Extent2::new(self.width_input, self.height_input));
+                self.model.resize(*dimensions);
             }
             if ui.button("Clear pins").clicked() {
                 let cleared = self.model.clear_pins();
                 self.notice = Some(format!("Cleared {cleared} pin(s)"));
             }
-            if ui.button("Reset all").clicked() {
-                self.model.reset_all();
-                self.width_input = DEFAULT_EXTENT.width;
-                self.height_input = DEFAULT_EXTENT.height;
-                self.cell_size = DEFAULT_CELL_SIZE;
-                self.steps_per_second = DEFAULT_STEPS_PER_SECOND;
-                self.notice = Some("Restored defaults".to_owned());
+            if ui.button("Reset mode").clicked() {
+                self.model.reset_active();
+                *dimensions = DEFAULT_EXTENT;
+                self.notice = Some(format!("Reset {} mode", mode.label()));
             }
         });
         ui.add(egui::Slider::new(&mut self.cell_size, 28.0..=80.0).text("Cell size"));
@@ -247,14 +260,8 @@ impl TilerApp {
         let groups: Vec<_> = self
             .model
             .tiles()
-            .iter()
-            .map(|(tile_id, tile)| {
-                (
-                    tile_id,
-                    tile.payload,
-                    self.model.variants_for_tile(tile_id).collect::<Vec<_>>(),
-                )
-            })
+            .into_iter()
+            .map(|(tile_id, style)| (tile_id, style, self.model.variants_for_tile(tile_id)))
             .collect();
         for (_tile_id, style, variant_indices) in groups {
             ui.add_space(5.0);
@@ -275,8 +282,12 @@ impl TilerApp {
                         if response.clicked() && enabled {
                             self.model.set_tool(CanvasTool::Pin(variant_index));
                         }
-                        let transform = self.model.variants()[variant_index].placement.transform;
-                        ui.label(RichText::new(transform_label(transform)).small());
+                        let orientation = self
+                            .model
+                            .variant(variant_index)
+                            .expect("palette contains catalog variants")
+                            .orientation;
+                        ui.label(RichText::new(orientation_label(orientation)).small());
                     });
                 }
             });
@@ -293,23 +304,26 @@ impl TilerApp {
         variant_index: usize,
         enabled: bool,
     ) -> egui::Response {
-        let variant = self.model.variants()[variant_index];
-        let tile = self
+        let variant = self
             .model
-            .tiles()
-            .get(variant.placement.tile)
+            .variant(variant_index)
+            .expect("preview contains a catalog variant");
+        let style = self
+            .model
+            .tile_style(variant.tile)
             .expect("variant refers to a demo tile");
         let (rect, response) = ui.allocate_exact_size(Vec2::splat(48.0), Sense::click());
         let selected = self.model.tool() == CanvasTool::Pin(variant_index);
         let fill = if enabled {
-            style_color(tile.payload)
+            style_color(style)
         } else {
             Color32::from_gray(42)
         };
-        ui.painter().rect_filled(rect, 5.0, fill);
-        ui.painter().rect_stroke(
+        paint_preview_cell(
+            ui.painter(),
             rect,
-            5.0,
+            self.model.mode(),
+            fill,
             Stroke::new(
                 if selected { 3.0 } else { 1.0 },
                 if selected {
@@ -318,14 +332,14 @@ impl TilerApp {
                     Color32::from_gray(100)
                 },
             ),
-            StrokeKind::Inside,
         );
         if enabled {
-            paint_tile_sockets(
+            paint_sockets(
                 ui.painter(),
-                rect.shrink(2.0),
-                tile,
-                variant.placement.transform,
+                rect.center(),
+                21.0,
+                self.model.mode(),
+                self.model.variant_sockets(variant_index),
             );
         } else {
             ui.painter().line_segment(
@@ -336,8 +350,8 @@ impl TilerApp {
         response.on_hover_text(if enabled {
             format!(
                 "Select {} {} as the pin brush",
-                tile.payload.name,
-                transform_label(variant.placement.transform)
+                style.name,
+                orientation_label(variant.orientation)
             )
         } else {
             "Enable this orientation before pinning it".to_owned()
@@ -352,7 +366,6 @@ impl TilerApp {
         };
         let cell = self
             .model
-            .topology()
             .cell_at(coord)
             .expect("selected coordinates are in bounds");
         ui.monospace(format!(
@@ -362,18 +375,21 @@ impl TilerApp {
             cell.index()
         ));
 
-        if let Some(pin) = self.model.pin_at(coord) {
-            let tile = self
+        if let Some(variant_index) = self.model.pin_variant_at(coord) {
+            let variant = self
                 .model
-                .tiles()
-                .get(pin.tile)
+                .variant(variant_index)
+                .expect("pins refer to catalog variants");
+            let style = self
+                .model
+                .tile_style(variant.tile)
                 .expect("pins refer to demo tiles");
             ui.colored_label(
                 Color32::from_rgb(255, 205, 80),
                 format!(
                     "Pinned: {} · {}",
-                    tile.payload.name,
-                    transform_label(pin.transform)
+                    style.name,
+                    orientation_label(variant.orientation)
                 ),
             );
         } else {
@@ -391,16 +407,18 @@ impl TilerApp {
                 );
             }
             CellVisual::Collapsed { variant, .. } => {
-                let placement = self.model.variants()[variant].placement;
-                let tile = self
+                let variant = self
                     .model
-                    .tiles()
-                    .get(placement.tile)
+                    .variant(variant)
+                    .expect("wave refers to a catalog variant");
+                let style = self
+                    .model
+                    .tile_style(variant.tile)
                     .expect("variant refers to a demo tile");
                 ui.label(format!(
                     "Collapsed: {} · {}",
-                    tile.payload.name,
-                    transform_label(placement.transform)
+                    style.name,
+                    orientation_label(variant.orientation)
                 ));
             }
             CellVisual::Superposition {
@@ -410,19 +428,17 @@ impl TilerApp {
                 ui.label(format!("{candidates} candidates · entropy {entropy:.3}"));
                 ui.horizontal_wrapped(|ui| {
                     for variant_index in self.model.candidate_variants(coord) {
-                        let placement = self.model.variants()[variant_index].placement;
-                        let tile = self
+                        let variant = self
                             .model
-                            .tiles()
-                            .get(placement.tile)
+                            .variant(variant_index)
+                            .expect("wave refers to a catalog variant");
+                        let style = self
+                            .model
+                            .tile_style(variant.tile)
                             .expect("variant refers to a demo tile");
                         ui.colored_label(
-                            style_color(tile.payload),
-                            format!(
-                                "{} {}",
-                                tile.payload.name,
-                                transform_label(placement.transform)
-                            ),
+                            style_color(style),
+                            format!("{} {}", style.name, orientation_label(variant.orientation)),
                         );
                     }
                 });
@@ -435,17 +451,16 @@ impl TilerApp {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let extent = self.model.extent();
-                let desired_size = Vec2::new(
-                    extent.width as f32 * self.cell_size,
-                    extent.height as f32 * self.cell_size,
-                );
+                let mode = self.model.mode();
+                let desired_size = canvas_size(mode, extent, self.cell_size);
                 let (response, painter) =
                     ui.allocate_painter(desired_size, Sense::click_and_drag());
                 let canvas = response.rect;
 
                 if response.hovered()
                     && let Some(pointer) = response.hover_pos()
-                    && let Some(coord) = pointer_coordinate(canvas, pointer, self.cell_size, extent)
+                    && let Some(coord) =
+                        pointer_coordinate(mode, canvas, pointer, self.cell_size, extent)
                 {
                     let (primary, secondary) = ui.input(|input| {
                         (
@@ -465,15 +480,13 @@ impl TilerApp {
     }
 
     fn paint_grid(&self, painter: &egui::Painter, canvas: Rect) {
+        let mode = self.model.mode();
         let total_candidates = self.model.enabled_variant_count().max(1);
-        for index in 0..self.model.topology().cell_count() {
-            let cell = seamless_tiler::CellId::new(index);
+        for index in 0..self.model.cell_count() {
             let coord = self
                 .model
-                .topology()
-                .coordinate(cell)
+                .coordinate(CellId::new(index))
                 .expect("topology cells have coordinates");
-            let rect = cell_rect(canvas, coord, self.cell_size).shrink(1.0);
             let visual = self.model.cell_visual(coord);
             let fill = match visual {
                 CellVisual::Unavailable => Color32::from_gray(28),
@@ -482,42 +495,49 @@ impl TilerApp {
                     uncertainty_color(candidates, total_candidates)
                 }
                 CellVisual::Collapsed { variant, .. } => {
-                    let tile = self
+                    let variant = self
                         .model
-                        .tiles()
-                        .get(self.model.variants()[variant].placement.tile)
-                        .expect("variant refers to a demo tile");
-                    style_color(tile.payload)
+                        .variant(variant)
+                        .expect("wave refers to a catalog variant");
+                    style_color(
+                        self.model
+                            .tile_style(variant.tile)
+                            .expect("variant refers to a demo tile"),
+                    )
                 }
             };
-            painter.rect_filled(rect, 3.0, fill);
-            painter.rect_stroke(
-                rect,
-                3.0,
+            paint_cell(
+                painter,
+                mode,
+                canvas,
+                coord,
+                self.cell_size,
+                fill,
                 Stroke::new(1.0, Color32::from_gray(82)),
-                StrokeKind::Inside,
             );
 
+            let center = cell_center(mode, canvas, coord, self.cell_size);
             match visual {
                 CellVisual::Contradiction => {
+                    let radius = cell_radius(mode, self.cell_size) * 0.55;
                     painter.line_segment(
                         [
-                            rect.left_top() + Vec2::splat(7.0),
-                            rect.right_bottom() - Vec2::splat(7.0),
+                            center + Vec2::new(-radius, -radius),
+                            center + Vec2::new(radius, radius),
                         ],
                         Stroke::new(3.0, Color32::from_rgb(255, 150, 150)),
                     );
                     painter.line_segment(
                         [
-                            Pos2::new(rect.right() - 7.0, rect.top() + 7.0),
-                            Pos2::new(rect.left() + 7.0, rect.bottom() - 7.0),
+                            center + Vec2::new(radius, -radius),
+                            center + Vec2::new(-radius, radius),
                         ],
                         Stroke::new(3.0, Color32::from_rgb(255, 150, 150)),
                     );
                 }
                 CellVisual::Superposition { candidates, .. } => {
                     painter.text(
-                        rect.center(),
+                        center,
                         Align2::CENTER_CENTER,
                         candidates,
                         FontId::monospace((self.cell_size * 0.25).clamp(10.0, 18.0)),
@@ -525,21 +545,22 @@ impl TilerApp {
                     );
                 }
                 CellVisual::Collapsed { variant, pinned } => {
-                    let placement = self.model.variants()[variant].placement;
-                    let tile = self
-                        .model
-                        .tiles()
-                        .get(placement.tile)
-                        .expect("variant refers to a demo tile");
-                    paint_tile_sockets(painter, rect, tile, placement.transform);
+                    paint_sockets(
+                        painter,
+                        center,
+                        cell_radius(mode, self.cell_size),
+                        mode,
+                        self.model.variant_sockets(variant),
+                    );
                     if pinned {
-                        painter.circle_filled(
-                            rect.right_top() + Vec2::new(-8.0, 8.0),
-                            7.0,
-                            Color32::from_rgb(255, 205, 80),
-                        );
+                        let badge = center
+                            + match mode {
+                                GridMode::Square => Vec2::new(0.35, -0.35) * self.cell_size,
+                                GridMode::Hex => Vec2::new(0.28, -0.30) * self.cell_size,
+                            };
+                        painter.circle_filled(badge, 7.0, Color32::from_rgb(255, 205, 80));
                         painter.text(
-                            rect.right_top() + Vec2::new(-8.0, 8.0),
+                            badge,
                             Align2::CENTER_CENTER,
                             "P",
                             FontId::monospace(8.0),
@@ -551,21 +572,27 @@ impl TilerApp {
             }
 
             if self.model.last_observed() == Some(coord) {
-                painter.rect_stroke(
-                    rect.shrink(2.0),
+                paint_cell_outline(
+                    painter,
+                    mode,
+                    canvas,
+                    coord,
+                    self.cell_size,
                     3.0,
                     Stroke::new(2.0, Color32::from_rgb(90, 220, 255)),
-                    StrokeKind::Inside,
                 );
             }
         }
 
         if let Some(selected) = self.model.selected_cell() {
-            painter.rect_stroke(
-                cell_rect(canvas, selected, self.cell_size).shrink(2.0),
+            paint_cell_outline(
+                painter,
+                mode,
+                canvas,
+                selected,
+                self.cell_size,
                 3.0,
                 Stroke::new(3.0, Color32::WHITE),
-                StrokeKind::Inside,
             );
         }
     }
@@ -579,17 +606,33 @@ fn boundary_selector(ui: &mut egui::Ui, label: &str, boundary: &mut Boundary) {
     });
 }
 
-fn transform_label(transform: D4) -> String {
-    let rotation = match transform.rotation() {
-        QuarterTurns::Zero => "0°",
-        QuarterTurns::One => "90°",
-        QuarterTurns::Two => "180°",
-        QuarterTurns::Three => "270°",
+fn orientation_label(orientation: Orientation) -> String {
+    let (degrees, reflected) = match orientation {
+        Orientation::Square(transform) => (
+            match transform.rotation() {
+                QuarterTurns::Zero => 0,
+                QuarterTurns::One => 90,
+                QuarterTurns::Two => 180,
+                QuarterTurns::Three => 270,
+            },
+            transform.is_reflected(),
+        ),
+        Orientation::Hex(transform) => (
+            match transform.rotation() {
+                SixthTurns::Zero => 0,
+                SixthTurns::One => 60,
+                SixthTurns::Two => 120,
+                SixthTurns::Three => 180,
+                SixthTurns::Four => 240,
+                SixthTurns::Five => 300,
+            },
+            transform.is_reflected(),
+        ),
     };
-    if transform.is_reflected() {
-        format!("{rotation} reflected")
+    if reflected {
+        format!("{degrees}° reflected")
     } else {
-        rotation.to_owned()
+        format!("{degrees}°")
     }
 }
 
@@ -612,85 +655,300 @@ fn uncertainty_color(candidates: usize, total: usize) -> Color32 {
     )
 }
 
+fn canvas_size(mode: GridMode, extent: Extent2, cell_size: f32) -> Vec2 {
+    match mode {
+        GridMode::Square => Vec2::new(
+            extent.width as f32 * cell_size,
+            extent.height as f32 * cell_size,
+        ),
+        GridMode::Hex => {
+            let width = hex_width(cell_size);
+            Vec2::new(
+                extent.width as f32 * width + if extent.height > 1 { width * 0.5 } else { 0.0 },
+                cell_size + extent.height.saturating_sub(1) as f32 * cell_size * 0.75,
+            )
+        }
+    }
+}
+
 fn pointer_coordinate(
+    mode: GridMode,
     canvas: Rect,
     pointer: Pos2,
     cell_size: f32,
     extent: Extent2,
 ) -> Option<Coord2> {
-    let local = pointer - canvas.min;
-    let coord = Coord2::new(
-        (local.x / cell_size).floor() as i32,
-        (local.y / cell_size).floor() as i32,
-    );
-    extent.contains(coord).then_some(coord)
+    match mode {
+        GridMode::Square => {
+            let local = pointer - canvas.min;
+            let coord = Coord2::new(
+                (local.x / cell_size).floor() as i32,
+                (local.y / cell_size).floor() as i32,
+            );
+            extent.contains(coord).then_some(coord)
+        }
+        GridMode::Hex => {
+            for y in 0..extent.height {
+                for x in 0..extent.width {
+                    let coord = Coord2::new(x as i32, y as i32);
+                    if point_in_convex_polygon(pointer, &hex_points(canvas, coord, cell_size, 0.0))
+                    {
+                        return Some(coord);
+                    }
+                }
+            }
+            None
+        }
+    }
 }
 
-fn cell_rect(canvas: Rect, coord: Coord2, cell_size: f32) -> Rect {
+fn point_in_convex_polygon(point: Pos2, polygon: &[Pos2]) -> bool {
+    let mut sign = 0.0_f32;
+    for index in 0..polygon.len() {
+        let start = polygon[index];
+        let end = polygon[(index + 1) % polygon.len()];
+        let cross =
+            (end.x - start.x) * (point.y - start.y) - (end.y - start.y) * (point.x - start.x);
+        if cross.abs() <= f32::EPSILON {
+            continue;
+        }
+        if sign == 0.0 {
+            sign = cross.signum();
+        } else if cross.signum() != sign {
+            return false;
+        }
+    }
+    true
+}
+
+fn cell_center(mode: GridMode, canvas: Rect, coord: Coord2, cell_size: f32) -> Pos2 {
+    match mode {
+        GridMode::Square => {
+            canvas.min
+                + Vec2::new(
+                    (coord.x as f32 + 0.5) * cell_size,
+                    (coord.y as f32 + 0.5) * cell_size,
+                )
+        }
+        GridMode::Hex => {
+            let width = hex_width(cell_size);
+            canvas.min
+                + Vec2::new(
+                    width * (coord.x as f32 + 0.5 + 0.5 * (coord.y & 1) as f32),
+                    cell_size * (0.5 + coord.y as f32 * 0.75),
+                )
+        }
+    }
+}
+
+fn cell_radius(mode: GridMode, cell_size: f32) -> f32 {
+    match mode {
+        GridMode::Square => cell_size * 0.5,
+        GridMode::Hex => cell_size * 0.5,
+    }
+}
+
+fn hex_width(cell_size: f32) -> f32 {
+    cell_size * SQRT_3 * 0.5
+}
+
+fn hex_points(canvas: Rect, coord: Coord2, cell_size: f32, inset: f32) -> [Pos2; 6] {
+    let center = cell_center(GridMode::Hex, canvas, coord, cell_size);
+    regular_hex_points(center, cell_size * 0.5 - inset)
+}
+
+fn regular_hex_points(center: Pos2, radius: f32) -> [Pos2; 6] {
+    std::array::from_fn(|index| {
+        let angle = -PI * 0.5 + index as f32 * PI / 3.0;
+        center + Vec2::new(angle.cos(), angle.sin()) * radius
+    })
+}
+
+fn square_rect(canvas: Rect, coord: Coord2, cell_size: f32) -> Rect {
     let min = canvas.min + Vec2::new(coord.x as f32 * cell_size, coord.y as f32 * cell_size);
     Rect::from_min_size(min, Vec2::splat(cell_size))
 }
 
-fn direction_vector(direction: SquareDirection) -> Vec2 {
-    match direction {
-        SquareDirection::North => Vec2::new(0.0, -1.0),
-        SquareDirection::East => Vec2::new(1.0, 0.0),
-        SquareDirection::South => Vec2::new(0.0, 1.0),
-        SquareDirection::West => Vec2::new(-1.0, 0.0),
+fn paint_preview_cell(
+    painter: &egui::Painter,
+    rect: Rect,
+    mode: GridMode,
+    fill: Color32,
+    stroke: Stroke,
+) {
+    match mode {
+        GridMode::Square => {
+            painter.rect_filled(rect, 5.0, fill);
+            painter.rect_stroke(rect, 5.0, stroke, StrokeKind::Inside);
+        }
+        GridMode::Hex => {
+            painter.add(Shape::convex_polygon(
+                regular_hex_points(rect.center(), 22.0).to_vec(),
+                fill,
+                stroke,
+            ));
+        }
     }
 }
 
-fn paint_tile_sockets(
+fn paint_cell(
     painter: &egui::Painter,
-    rect: Rect,
-    tile: &Tile<TileStyle, SquareDirection, bool>,
-    transform: D4,
+    mode: GridMode,
+    canvas: Rect,
+    coord: Coord2,
+    cell_size: f32,
+    fill: Color32,
+    stroke: Stroke,
 ) {
-    let center = rect.center();
-    for direction in SquareDirection::ALL {
-        if !tile.oriented_socket(transform, *direction) {
+    match mode {
+        GridMode::Square => {
+            let rect = square_rect(canvas, coord, cell_size).shrink(1.0);
+            painter.rect_filled(rect, 3.0, fill);
+            painter.rect_stroke(rect, 3.0, stroke, StrokeKind::Inside);
+        }
+        GridMode::Hex => {
+            painter.add(Shape::convex_polygon(
+                hex_points(canvas, coord, cell_size, 1.0).to_vec(),
+                fill,
+                stroke,
+            ));
+        }
+    }
+}
+
+fn paint_cell_outline(
+    painter: &egui::Painter,
+    mode: GridMode,
+    canvas: Rect,
+    coord: Coord2,
+    cell_size: f32,
+    inset: f32,
+    stroke: Stroke,
+) {
+    match mode {
+        GridMode::Square => {
+            painter.rect_stroke(
+                square_rect(canvas, coord, cell_size).shrink(inset),
+                3.0,
+                stroke,
+                StrokeKind::Inside,
+            );
+        }
+        GridMode::Hex => {
+            painter.add(Shape::closed_line(
+                hex_points(canvas, coord, cell_size, inset).to_vec(),
+                stroke,
+            ));
+        }
+    }
+}
+
+fn paint_sockets(
+    painter: &egui::Painter,
+    center: Pos2,
+    radius: f32,
+    mode: GridMode,
+    sockets: &[bool],
+) {
+    for (index, socket) in sockets.iter().copied().enumerate() {
+        if !socket {
             continue;
         }
-        let vector = direction_vector(*direction);
-        let start = center + vector * (rect.width() * 0.12);
-        let end = center + vector * (rect.width() * 0.46);
+        let vector = match mode {
+            GridMode::Square => match index {
+                0 => Vec2::new(0.0, -1.0),
+                1 => Vec2::new(1.0, 0.0),
+                2 => Vec2::new(0.0, 1.0),
+                _ => Vec2::new(-1.0, 0.0),
+            },
+            GridMode::Hex => {
+                let angle = -PI / 3.0 + index as f32 * PI / 3.0;
+                Vec2::new(angle.cos(), angle.sin())
+            }
+        };
         painter.line_segment(
-            [start, end],
-            Stroke::new((rect.width() * 0.1).clamp(3.0, 6.0), Color32::WHITE),
+            [
+                center + vector * (radius * 0.24),
+                center + vector * (radius * 0.92),
+            ],
+            Stroke::new((radius * 0.2).clamp(3.0, 6.0), Color32::WHITE),
         );
     }
-    painter.circle_filled(center, rect.width() * 0.09, Color32::WHITE);
+    painter.circle_filled(center, radius * 0.18, Color32::WHITE);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use seamless_tiler::{D4, D6};
 
     #[test]
-    fn pointer_coordinates_respect_canvas_bounds() {
+    fn square_pointer_coordinates_respect_canvas_bounds() {
         let canvas = Rect::from_min_size(Pos2::new(10.0, 20.0), Vec2::new(100.0, 50.0));
         let extent = Extent2::new(2, 1);
         assert_eq!(
-            pointer_coordinate(canvas, Pos2::new(75.0, 30.0), 50.0, extent),
+            pointer_coordinate(
+                GridMode::Square,
+                canvas,
+                Pos2::new(75.0, 30.0),
+                50.0,
+                extent
+            ),
             Some(Coord2::new(1, 0))
         );
         assert_eq!(
-            pointer_coordinate(canvas, Pos2::new(110.0, 30.0), 50.0, extent),
+            pointer_coordinate(
+                GridMode::Square,
+                canvas,
+                Pos2::new(110.0, 30.0),
+                50.0,
+                extent
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn hex_pointer_coordinates_find_staggered_cells_and_reject_corner_gaps() {
+        let extent = Extent2::new(2, 2);
+        let size = 60.0;
+        let canvas = Rect::from_min_size(
+            Pos2::new(10.0, 20.0),
+            canvas_size(GridMode::Hex, extent, size),
+        );
+        for coord in [Coord2::new(0, 0), Coord2::new(1, 0), Coord2::new(0, 1)] {
+            assert_eq!(
+                pointer_coordinate(
+                    GridMode::Hex,
+                    canvas,
+                    cell_center(GridMode::Hex, canvas, coord, size),
+                    size,
+                    extent
+                ),
+                Some(coord)
+            );
+        }
+        assert_eq!(
+            pointer_coordinate(GridMode::Hex, canvas, canvas.left_top(), size, extent),
             None
         );
     }
 
     #[test]
     fn uncertainty_colors_distinguish_small_and_large_domains() {
-        assert_ne!(uncertainty_color(2, 12), uncertainty_color(12, 12));
+        assert_ne!(uncertainty_color(2, 13), uncertainty_color(13, 13));
     }
 
     #[test]
-    fn transform_labels_include_reflection() {
-        assert_eq!(transform_label(D4::IDENTITY), "0°");
+    fn orientation_labels_cover_square_and_hex_rotations() {
+        assert_eq!(orientation_label(Orientation::Square(D4::IDENTITY)), "0°");
         assert_eq!(
-            transform_label(D4::new(QuarterTurns::One, true)),
+            orientation_label(Orientation::Square(D4::new(QuarterTurns::One, true))),
             "90° reflected"
+        );
+        assert_eq!(
+            orientation_label(Orientation::Hex(D6::new(SixthTurns::Five, false))),
+            "300°"
         );
     }
 }

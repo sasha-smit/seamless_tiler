@@ -8,16 +8,18 @@ types from focused private modules:
 
 - `spatial.rs`: coordinates, extents, and rectangles.
 - `grid.rs`: owned row-major rectangular storage.
-- `topology.rs`: generic neighborhood traits and square topology.
-- `transform.rs`: square rotations and reflections (`D4`).
+- `topology.rs`: generic neighborhood traits plus square and pointy-top hex
+  topologies.
+- `transform.rs`: square (`D4`) and hexagonal (`D6`) rotations and reflections.
 - `tile.rs`: sockets, tiles, stable IDs, and matching policies.
 - `wfc.rs`: weighted compatibility rules, wave domains, observation, and
   constraint propagation over generic topologies.
 
 The `ui/` workspace member is the native `seamless_tiler_ui` binary. Its
 `src/main.rs` configures eframe with the wgpu renderer, `src/model.rs` owns the
-session-only WFC configuration and tile adapter, and `src/app.rs` owns egui
-controls and canvas painting.
+independent session-only square and hex WFC configurations and tile adapters,
+and `src/app.rs` owns egui controls, mode-aware geometry, hit testing, and canvas
+painting.
 
 Unit tests live beside their implementation in `#[cfg(test)]` modules. Crate-level
 examples are doctests in `src/lib.rs`. There are currently no runtime assets;
@@ -35,6 +37,14 @@ tiles and applies demo-specific policies such as closed bounded edges. The UI
 may depend on the library, but the library must not depend on eframe, egui, wgpu,
 or UI-specific payloads. Keep the native UI session-only unless persistence or a
 project format is explicitly designed.
+
+`HexTopology` uses dense odd-row offset `Coord2` coordinates: odd rows are
+visually shifted half a cell to the right. Keep wrapped neighbor relationships
+reciprocal for odd and even extents, including degenerate dimensions. Tile
+orientation should go through `DirectionTransform`; use `D4` with
+`SquareDirection` and `D6` with `HexDirection`. The UI should retain independent
+square and hex dimensions, boundaries, pins, enabled variants, seeds, and solver
+progress when switching modes.
 
 ## Build, Test, and Development Commands
 
@@ -62,7 +72,9 @@ Use `rustfmt` defaults (four-space indentation). Follow Rust naming conventions:
 checked arithmetic at coordinate boundaries, explicit error types, and rustdoc
 for public behavior or invariants. Re-export intended public APIs from `lib.rs`.
 Keep seeded solver behavior deterministic, validate public rule inputs, and
-handle wrapped self-neighbors as unary constraints during propagation.
+handle wrapped self-neighbors as unary constraints during propagation. Keep
+direction values dense and clockwise, preserve opposite-direction involutions,
+and test transform inverse and composition laws exhaustively.
 
 ## Testing Guidelines
 
@@ -72,9 +84,10 @@ degenerate dimensions, overflow, and algebraic laws. Every public example must
 remain a passing doctest. No coverage percentage is mandated, but new behavior
 must have focused regression tests. Keep UI state transitions in testable model
 methods rather than egui callbacks where practical. Manually smoke-test native
-window creation, allowed-orientation toggles, inspect/pin/unpin tools, resizing,
-bounded and wrapped topology, seed reset and retry, and step/run/pause/finish
-playback after altering interactive behavior.
+window creation, switching between square and hex modes without losing either
+session, allowed-orientation toggles, inspect/pin/unpin tools, polygon hit
+testing, resizing, bounded and independently wrapped axes, seed reset and retry,
+and step/run/pause/finish playback after altering interactive behavior.
 
 ## Commit & Pull Request Guidelines
 

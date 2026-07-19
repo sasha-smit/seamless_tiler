@@ -9,8 +9,9 @@
 //!
 //! ```
 //! use seamless_tiler::{
-//!     AxisBoundaries, Boundary, Coord2, Extent2, PatternId, SocketMap, SquareDirection,
-//!     SquareTopology, Tile, TileSet, Topology, Wfc, WfcRules, WfcStatus,
+//!     AxisBoundaries, Boundary, Coord2, Extent2, HexDirection, HexTopology, PatternId,
+//!     SocketMap, SquareDirection, SquareTopology, Tile, TileSet, Topology, Wfc, WfcRules,
+//!     WfcStatus,
 //! };
 //!
 //! let mut tiles = TileSet::new();
@@ -35,6 +36,11 @@
 //!     cylinder.coordinate(cylinder.neighbor(left, SquareDirection::West).unwrap()),
 //!     Some(Coord2::new(2, 0)),
 //! );
+//! let hexes = HexTopology::bounded(extent)?;
+//! let hex_origin = hexes.cell_at(Coord2::ZERO).unwrap();
+//! assert!(hexes
+//!     .neighbor(hex_origin, HexDirection::SouthEast)
+//!     .is_some());
 //!
 //! let rules = WfcRules::new([1.0, 1.0], |_direction, source, neighbor| {
 //!     source == neighbor
@@ -57,8 +63,8 @@ pub use grid::{Grid, GridError};
 pub use spatial::{Coord2, Extent2, Rect};
 pub use tile::{EqualityMatcher, OrientedTileId, SocketMap, SocketMatcher, Tile, TileId, TileSet};
 pub use topology::{
-    AxisBoundaries, Boundary, CellId, Direction, SquareDirection, SquareTopology, Topology,
-    TopologyError,
+    AxisBoundaries, Boundary, CellId, Direction, HexDirection, HexTopology, SquareDirection,
+    SquareTopology, Topology, TopologyError,
 };
-pub use transform::{D4, QuarterTurns};
+pub use transform::{D4, D6, DirectionTransform, QuarterTurns, SixthTurns};
 pub use wfc::{PatternId, Wfc, WfcError, WfcRules, WfcStatus, WfcStep};

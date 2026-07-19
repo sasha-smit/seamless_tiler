@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 use std::ops::{Index, IndexMut};
 
-use crate::{D4, Direction, SquareDirection};
+use crate::{Direction, DirectionTransform};
 
 /// One value for every member of a finite [`Direction`] set.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -69,9 +69,13 @@ impl<P, D, S> Tile<P, D, S> {
     }
 }
 
-impl<P, S> Tile<P, SquareDirection, S> {
+impl<P, D: Direction, S> Tile<P, D, S> {
     /// Looks up the socket presented in a world-space direction after transformation.
-    pub fn oriented_socket(&self, transform: D4, world_direction: SquareDirection) -> &S {
+    pub fn oriented_socket<T: DirectionTransform<D>>(
+        &self,
+        transform: T,
+        world_direction: D,
+    ) -> &S {
         let local_direction = transform.inverse().apply_direction(world_direction);
         &self.sockets[local_direction]
     }
@@ -178,7 +182,7 @@ impl<D, S: PartialEq> SocketMatcher<D, S> for EqualityMatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{QuarterTurns, SocketMatcher};
+    use crate::{D4, D6, HexDirection, QuarterTurns, SixthTurns, SocketMatcher, SquareDirection};
 
     fn labeled_tile() -> Tile<&'static str, SquareDirection, char> {
         Tile::new(
@@ -220,6 +224,25 @@ mod tests {
             tile.oriented_socket(reflection, SquareDirection::West),
             &'e'
         );
+    }
+
+    #[test]
+    fn oriented_socket_supports_hex_transforms() {
+        let tile = Tile::new(
+            "road",
+            SocketMap::from_fn(|direction| match direction {
+                HexDirection::NorthEast => 'a',
+                HexDirection::East => 'b',
+                HexDirection::SouthEast => 'c',
+                HexDirection::SouthWest => 'd',
+                HexDirection::West => 'e',
+                HexDirection::NorthWest => 'f',
+            }),
+        );
+        let clockwise = D6::new(SixthTurns::One, false);
+        assert_eq!(tile.oriented_socket(clockwise, HexDirection::East), &'a');
+        let reflection = D6::new(SixthTurns::Zero, true);
+        assert_eq!(tile.oriented_socket(reflection, HexDirection::West), &'b');
     }
 
     #[test]
