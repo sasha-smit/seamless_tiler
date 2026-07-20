@@ -2,11 +2,12 @@ use std::f32::consts::PI;
 use std::time::Duration;
 
 use eframe::egui::{
-    self, Align2, Color32, FontId, PointerButton, Pos2, Rect, RichText, Sense, Shape, Stroke,
-    StrokeKind, Vec2,
+    self, Align2, Color32, ColorImage, FontId, PointerButton, Pos2, Rect, RichText, Sense, Shape,
+    Stroke, StrokeKind, TextureHandle, TextureOptions, Vec2,
 };
 use seamless_tiler::{
-    AxisBoundaries, Boundary, CellId, Coord2, Extent2, QuarterTurns, SixthTurns, TileId, WfcStatus,
+    AxisBoundaries, Boundary, CellId, Coord2, D4, Extent2, QuarterTurns, SixthTurns, TileId,
+    WfcStatus,
 };
 
 use crate::model::{
@@ -16,6 +17,7 @@ use crate::model::{
 const DEFAULT_CELL_SIZE: f32 = 52.0;
 const DEFAULT_STEPS_PER_SECOND: f32 = 8.0;
 const SQRT_3: f32 = 1.732_050_8;
+const RASTER_SIZE: usize = 32;
 
 pub struct TilerApp {
     model: EditorModel,
@@ -25,6 +27,15 @@ pub struct TilerApp {
     last_frame_time: f64,
     step_accumulator: f64,
     notice: Option<String>,
+    raster_cache: Option<RasterCache>,
+}
+
+/// Per-variant textures for the active square catalog, rebuilt when the mode or
+/// catalog version changes. Empty in hex mode, which renders flat fill + stubs.
+struct RasterCache {
+    mode: GridMode,
+    version: u64,
+    textures: Vec<Option<TextureHandle>>,
 }
 
 impl Default for TilerApp {
@@ -37,6 +48,7 @@ impl Default for TilerApp {
             last_frame_time: 0.0,
             step_accumulator: 0.0,
             notice: None,
+            raster_cache: None,
         }
     }
 }
@@ -44,6 +56,7 @@ impl Default for TilerApp {
 impl eframe::App for TilerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.advance_playback(ui);
+        self.ensure_rasters(ui.ctx());
 
         egui::Panel::top("instructions").show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -87,6 +100,66 @@ impl TilerApp {
             }
         }
         ui.ctx().request_repaint_after(Duration::from_millis(16));
+    }
+
+    fn ensure_rasters(&mut self, ctx: &egui::Context) {
+        let mode = self.model.mode();
+        let version = self.model.catalog_version();
+        if self
+            .raster_cache
+            .as_ref()
+            .is_some_and(|cache| cache.mode == mode && cache.version == version)
+        {
+            return;
+        }
+        let textures = if mode == GridMode::Square {
+            (0..self.model.variant_count())
+                .map(|index| self.build_variant_texture(ctx, index))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        self.raster_cache = Some(RasterCache {
+            mode,
+            version,
+            textures,
+        });
+    }
+
+    fn build_variant_texture(&self, ctx: &egui::Context, index: usize) -> Option<TextureHandle> {
+        let variant = self.model.variant(index)?;
+        let Orientation::Square(transform) = variant.orientation else {
+            return None;
+        };
+        let color = self.model.tile_style(variant.tile)?.color;
+        let base = rasterize_tile(&self.model.tile_sockets(variant.tile), color);
+        let raster = transform_raster(&base, transform);
+        let bytes: Vec<u8> = raster.pixels.iter().flatten().copied().collect();
+        let image = ColorImage::from_rgba_unmultiplied([raster.size, raster.size], &bytes);
+        Some(ctx.load_texture(format!("variant-{index}"), image, TextureOptions::NEAREST))
+    }
+
+    /// The cached texture for a variant in the active square catalog, if any.
+    fn variant_texture(&self, index: usize) -> Option<&TextureHandle> {
+        self.raster_cache
+            .as_ref()
+            .filter(|cache| cache.mode == self.model.mode())
+            .and_then(|cache| cache.textures.get(index))
+            .and_then(Option::as_ref)
+    }
+
+    /// Draws a variant's raster into `rect`, returning whether a texture existed.
+    fn paint_variant_texture(&self, painter: &egui::Painter, rect: Rect, index: usize) -> bool {
+        let Some(texture) = self.variant_texture(index) else {
+            return false;
+        };
+        painter.image(
+            texture.id(),
+            rect,
+            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+            Color32::WHITE,
+        );
+        true
     }
 
     fn show_controls(&mut self, ui: &mut egui::Ui) {
@@ -383,13 +456,17 @@ impl TilerApp {
             ),
         );
         if enabled {
-            paint_sockets(
-                ui.painter(),
-                rect.center(),
-                21.0,
-                self.model.mode(),
-                self.model.variant_sockets(variant_index),
-            );
+            let drew_raster = self.model.mode() == GridMode::Square
+                && self.paint_variant_texture(ui.painter(), rect.shrink(4.0), variant_index);
+            if !drew_raster {
+                paint_sockets(
+                    ui.painter(),
+                    rect.center(),
+                    21.0,
+                    self.model.mode(),
+                    self.model.variant_sockets(variant_index),
+                );
+            }
         } else {
             ui.painter().line_segment(
                 [rect.left_top(), rect.right_bottom()],
@@ -456,19 +533,23 @@ impl TilerApp {
                 );
             }
             CellVisual::Collapsed { variant, .. } => {
-                let variant = self
+                let view = self
                     .model
                     .variant(variant)
                     .expect("wave refers to a catalog variant");
                 let style = self
                     .model
-                    .tile_style(variant.tile)
+                    .tile_style(view.tile)
                     .expect("variant refers to a demo tile");
                 ui.label(format!(
                     "Collapsed: {} · {}",
                     style.name,
-                    orientation_label(variant.orientation)
+                    orientation_label(view.orientation)
                 ));
+                if self.model.mode() == GridMode::Square {
+                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(44.0), Sense::hover());
+                    self.paint_variant_texture(ui.painter(), rect, variant);
+                }
             }
             CellVisual::Superposition {
                 candidates,
@@ -595,13 +676,19 @@ impl TilerApp {
                     );
                 }
                 CellVisual::Collapsed { variant, pinned } => {
-                    paint_sockets(
-                        painter,
-                        center,
-                        self.cell_size * 0.5,
-                        mode,
-                        self.model.variant_sockets(variant),
-                    );
+                    let drew_raster = mode == GridMode::Square && {
+                        let rect = square_rect(canvas, coord, self.cell_size).shrink(1.0);
+                        self.paint_variant_texture(painter, rect, variant)
+                    };
+                    if !drew_raster {
+                        paint_sockets(
+                            painter,
+                            center,
+                            self.cell_size * 0.5,
+                            mode,
+                            self.model.variant_sockets(variant),
+                        );
+                    }
                     if pinned {
                         let badge = center
                             + match mode {
@@ -927,10 +1014,113 @@ fn paint_sockets(
     painter.circle_filled(center, radius * 0.18, Color32::WHITE);
 }
 
+/// A square RGBA pixel buffer used to render a tile.
+#[derive(Clone, PartialEq)]
+struct Raster {
+    size: usize,
+    pixels: Vec<Rgba>,
+}
+
+type Rgba = [u8; 4];
+
+impl Raster {
+    fn filled(size: usize, color: Rgba) -> Self {
+        Self {
+            size,
+            pixels: vec![color; size * size],
+        }
+    }
+
+    fn get(&self, x: usize, y: usize) -> Rgba {
+        self.pixels[y * self.size + x]
+    }
+
+    fn set(&mut self, x: usize, y: usize, color: Rgba) {
+        self.pixels[y * self.size + x] = color;
+    }
+}
+
+/// Screen-space unit vector for a square socket, matching `paint_sockets` and
+/// `SquareDirection::ALL` order (North, East, South, West).
+fn socket_vector(index: usize) -> (f32, f32) {
+    match index {
+        0 => (0.0, -1.0),
+        1 => (1.0, 0.0),
+        2 => (0.0, 1.0),
+        _ => (-1.0, 0.0),
+    }
+}
+
+/// Draws a tile's base (identity-orientation) picture from its local sockets:
+/// a dim background of `color` with a bright hub and an arm toward each active
+/// edge. Orientation is applied later by [`transform_raster`].
+fn rasterize_tile(sockets: &[bool], color: [u8; 3]) -> Raster {
+    let dim = |c: u8| (c as f32 * 0.30) as u8;
+    let bright = |c: u8| (c as f32 * 0.5 + 128.0).min(255.0) as u8;
+    let background = [dim(color[0]), dim(color[1]), dim(color[2]), 255];
+    let road = [bright(color[0]), bright(color[1]), bright(color[2]), 255];
+
+    let size = RASTER_SIZE;
+    let mut raster = Raster::filled(size, background);
+    let center = (size as f32 - 1.0) / 2.0;
+    let reach = center;
+    let arm_half = size as f32 * 0.16;
+    let hub_half = size as f32 * 0.18;
+
+    for y in 0..size {
+        for x in 0..size {
+            let rx = x as f32 - center;
+            let ry = y as f32 - center;
+            let mut on_road = rx.abs() <= hub_half && ry.abs() <= hub_half;
+            if !on_road {
+                for (index, active) in sockets.iter().enumerate() {
+                    if !active {
+                        continue;
+                    }
+                    let (dx, dy) = socket_vector(index);
+                    let along = rx * dx + ry * dy;
+                    let perp = rx * -dy + ry * dx;
+                    if along >= 0.0 && along <= reach && perp.abs() <= arm_half {
+                        on_road = true;
+                        break;
+                    }
+                }
+            }
+            if on_road {
+                raster.set(x, y, road);
+            }
+        }
+    }
+    raster
+}
+
+/// Reorients a raster through a `D4` symmetry, reusing [`D4::checked_apply`] so
+/// pixels rotate and reflect with the exact convention used for sockets. Pixel
+/// centers are mapped through doubled, center-relative coordinates so the
+/// halving back to indices is always exact, and the transform is a bijection
+/// over the lattice so every destination pixel is written once.
+fn transform_raster(base: &Raster, transform: D4) -> Raster {
+    let size = base.size;
+    let offset = size as i32 - 1;
+    let mut out = Raster::filled(size, [0, 0, 0, 0]);
+    for y in 0..size {
+        for x in 0..size {
+            let vector = Coord2::new(2 * x as i32 - offset, 2 * y as i32 - offset);
+            let mapped = transform
+                .checked_apply(vector)
+                .expect("raster coordinates are small enough to never overflow");
+            let nx = ((mapped.x + offset) / 2) as usize;
+            let ny = ((mapped.y + offset) / 2) as usize;
+            out.set(nx, ny, base.get(x, y));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use seamless_tiler::{D4, D6};
+    use seamless_tiler::D6;
 
     #[test]
     fn square_pointer_coordinates_respect_canvas_bounds() {
@@ -1000,5 +1190,73 @@ mod tests {
             orientation_label(Orientation::Hex(D6::new(SixthTurns::Five, false))),
             "300°"
         );
+    }
+
+    const TEST_COLOR: [u8; 3] = [200, 160, 120];
+
+    fn north_arm() -> Raster {
+        rasterize_tile(&[true, false, false, false], TEST_COLOR)
+    }
+
+    #[test]
+    fn identity_transform_leaves_a_raster_unchanged() {
+        let base = north_arm();
+        assert_eq!(transform_raster(&base, D4::IDENTITY).pixels, base.pixels);
+    }
+
+    #[test]
+    fn four_quarter_turns_return_the_original_raster() {
+        let base = north_arm();
+        let quarter = D4::new(QuarterTurns::One, false);
+        let mut rotated = base.clone();
+        for _ in 0..4 {
+            rotated = transform_raster(&rotated, quarter);
+        }
+        assert_eq!(rotated.pixels, base.pixels);
+    }
+
+    #[test]
+    fn transform_then_inverse_restores_the_raster() {
+        let base = rasterize_tile(&[true, true, false, false], TEST_COLOR);
+        for transform in D4::ALL {
+            let there = transform_raster(&base, transform);
+            let back = transform_raster(&there, transform.inverse());
+            assert_eq!(
+                back.pixels, base.pixels,
+                "transform {transform:?} round-trip"
+            );
+        }
+    }
+
+    #[test]
+    fn rotating_a_north_arm_raster_points_it_east() {
+        let base = north_arm();
+        let rotated = transform_raster(&base, D4::new(QuarterTurns::One, false));
+        let mid = RASTER_SIZE / 2;
+        // The north arm's bright road moves to the east edge; the north edge clears,
+        // mirroring apply_direction(North) == East.
+        assert_eq!(rotated.get(RASTER_SIZE - 2, mid), base.get(mid, 1));
+        assert_eq!(rotated.get(mid, 1), base.get(1, mid));
+    }
+
+    #[test]
+    fn reflection_mirrors_an_east_arm_to_the_west() {
+        let base = rasterize_tile(&[false, true, false, false], TEST_COLOR);
+        let reflected = transform_raster(&base, D4::new(QuarterTurns::Zero, true));
+        let mid = RASTER_SIZE / 2;
+        let road = base.get(RASTER_SIZE - 2, mid);
+        let background = base.get(1, mid);
+        assert_ne!(road, background);
+        assert_eq!(reflected.get(1, mid), road);
+        assert_eq!(reflected.get(RASTER_SIZE - 2, mid), background);
+    }
+
+    #[test]
+    fn rasterize_marks_only_active_socket_edges() {
+        let base = north_arm();
+        let mid = RASTER_SIZE / 2;
+        // North edge is road; west and south edges stay background.
+        assert_ne!(base.get(mid, 1), base.get(1, mid));
+        assert_eq!(base.get(mid, RASTER_SIZE - 2), base.get(1, mid));
     }
 }

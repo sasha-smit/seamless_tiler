@@ -180,6 +180,7 @@ struct Session<M: ModeSpec> {
     running: bool,
     observations: usize,
     last_observed: Option<Coord2>,
+    version: u64,
     mode: PhantomData<M>,
 }
 
@@ -207,6 +208,7 @@ impl<M: ModeSpec> Session<M> {
             running: false,
             observations: 0,
             last_observed: None,
+            version: 0,
             mode: PhantomData,
         };
         session.rebuild_wave();
@@ -331,6 +333,7 @@ impl<M: ModeSpec> Session<M> {
     fn set_tile_color(&mut self, tile: TileId, color: [u8; 3]) {
         if let Some(value) = self.tiles.get_mut(tile) {
             value.payload.color = color;
+            self.version = self.version.wrapping_add(1);
         }
     }
 
@@ -402,6 +405,7 @@ impl<M: ModeSpec> Session<M> {
         self.variants = variants;
         self.variant_sockets = variant_sockets;
         self.enabled = enabled;
+        self.version = self.version.wrapping_add(1);
         self.rebuild_wave();
     }
 
@@ -410,6 +414,14 @@ impl<M: ModeSpec> Session<M> {
             .get(tile)
             .map(|value| value.sockets.iter().map(|(_, socket)| *socket).collect())
             .unwrap_or_default()
+    }
+
+    fn variant_count(&self) -> usize {
+        self.variants.len()
+    }
+
+    fn catalog_version(&self) -> u64 {
+        self.version
     }
 
     fn apply_tool(&mut self, coord: Coord2, secondary: bool) -> bool {
@@ -676,6 +688,8 @@ trait SessionAccess {
     fn variant_sockets(&self, index: usize) -> &[bool];
     fn variant_enabled(&self, index: usize) -> bool;
     fn tile_sockets(&self, tile: TileId) -> Vec<bool>;
+    fn variant_count(&self) -> usize;
+    fn catalog_version(&self) -> u64;
     fn variants_for_tile(&self, tile: TileId) -> Vec<usize>;
     fn enabled_variant_count(&self) -> usize;
     fn seed(&self) -> u64;
@@ -743,6 +757,12 @@ impl<M: ModeSpec> SessionAccess for Session<M> {
     }
     fn tile_sockets(&self, tile: TileId) -> Vec<bool> {
         self.tile_sockets(tile)
+    }
+    fn variant_count(&self) -> usize {
+        self.variant_count()
+    }
+    fn catalog_version(&self) -> u64 {
+        self.catalog_version()
     }
     fn variants_for_tile(&self, tile: TileId) -> Vec<usize> {
         self.variants
@@ -926,6 +946,12 @@ impl EditorModel {
     }
     pub(crate) fn tile_sockets(&self, tile: TileId) -> Vec<bool> {
         self.active().tile_sockets(tile)
+    }
+    pub(crate) fn variant_count(&self) -> usize {
+        self.active().variant_count()
+    }
+    pub(crate) fn catalog_version(&self) -> u64 {
+        self.active().catalog_version()
     }
     pub(crate) fn variants_for_tile(&self, tile: TileId) -> Vec<usize> {
         self.active().variants_for_tile(tile)
@@ -1277,6 +1303,35 @@ mod tests {
         let style = model.tile_style(TileId::new(0)).unwrap();
         assert_eq!(style.name, "Empty");
         assert_eq!(style.color, [1, 2, 3]);
+    }
+
+    #[test]
+    fn catalog_version_bumps_on_appearance_edits_only() {
+        let mut model = EditorModel::new(Extent2::new(3, 3));
+        let start = model.catalog_version();
+
+        model.set_tile_socket(TileId::new(0), 0, true);
+        let after_socket = model.catalog_version();
+        assert!(after_socket > start);
+
+        model.set_tile_color(TileId::new(0), [1, 2, 3]);
+        let after_color = model.catalog_version();
+        assert!(after_color > after_socket);
+
+        model.add_tile();
+        let after_add = model.catalog_version();
+        assert!(after_add > after_color);
+
+        model.remove_tile(TileId::new(0));
+        let after_remove = model.catalog_version();
+        assert!(after_remove > after_add);
+
+        // Rename and enable-toggle do not change the tile's appearance.
+        model.set_tile_name(TileId::new(0), "renamed".to_owned());
+        assert_eq!(model.catalog_version(), after_remove);
+        let variant = model.variants_for_tile(TileId::new(0))[0];
+        model.set_variant_enabled(variant, false);
+        assert_eq!(model.catalog_version(), after_remove);
     }
 
     #[test]
