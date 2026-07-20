@@ -91,7 +91,10 @@ and step/run/pause/finish playback after altering interactive behavior.
 
 ## Commit & Pull Request Guidelines
 
-Use an imperative, descriptive subject followed by a detailed multi-paragraph
-body; wrap every commit-message line at 72 columns. Attribute agent-authored work
-with `Co-authored-by: Name (<exact-model>, <effort>) <email>`; ask
+Commit directly to `master` unless asked otherwise; do not create a feature
+branch by default. Use an imperative, descriptive subject followed by a detailed
+multi-paragraph body; wrap every commit-message line at 72 columns. Attribute
+agent-authored work with `Co-authored-by: Name (<model>, <effort>) <email>`,
+writing the model with a dot rather than the API's hyphen — for example
+`Co-authored-by: Claude (claude-opus-4.8, high) <noreply@anthropic.com>`; ask
 for missing runtime identity rather than guessing.
