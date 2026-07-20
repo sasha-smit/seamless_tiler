@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::marker::PhantomData;
 
 use seamless_tiler::{
@@ -10,6 +11,7 @@ pub(crate) const DEFAULT_EXTENT: Extent2 = Extent2::new(12, 8);
 pub(crate) const MAX_DIMENSION: usize = 64;
 pub(crate) const DEFAULT_SEED: u64 = 1;
 const DEFAULT_HEX_SEED: u64 = 3;
+const NEW_TILE_COLOR: [u8; 3] = [120, 120, 120];
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) enum GridMode {
@@ -33,9 +35,9 @@ impl GridMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct TileStyle {
-    pub(crate) name: &'static str,
+    pub(crate) name: String,
     pub(crate) color: [u8; 3],
 }
 
@@ -69,7 +71,7 @@ pub(crate) enum CellVisual {
 
 trait ModeSpec: 'static {
     type Direction: Direction;
-    type Transform: DirectionTransform<Self::Direction> + Copy + Eq;
+    type Transform: DirectionTransform<Self::Direction> + Copy + Eq + std::hash::Hash;
     type Topology: Topology<Coord = Coord2, Direction = Self::Direction> + Copy;
 
     fn topology(extent: Extent2, boundaries: AxisBoundaries) -> Self::Topology;
@@ -284,6 +286,130 @@ impl<M: ModeSpec> Session<M> {
         }
         self.rebuild_wave();
         cleared
+    }
+
+    fn add_tile(&mut self) {
+        let name = format!("Tile {}", self.tiles.len() + 1);
+        self.tiles.insert(Tile::new(
+            TileStyle {
+                name,
+                color: NEW_TILE_COLOR,
+            },
+            SocketMap::from_fn(|_| false),
+        ));
+        self.refresh_catalog(Some);
+    }
+
+    fn remove_tile(&mut self, tile: TileId) {
+        if self.tiles.get(tile).is_none() {
+            return;
+        }
+        let removed = tile.index();
+        let mut rebuilt = TileSet::with_capacity(self.tiles.len().saturating_sub(1));
+        for (id, value) in self.tiles.iter() {
+            if id != tile {
+                rebuilt.insert(value.clone());
+            }
+        }
+        self.tiles = rebuilt;
+        self.refresh_catalog(|old| {
+            let index = old.index();
+            match index.cmp(&removed) {
+                std::cmp::Ordering::Less => Some(old),
+                std::cmp::Ordering::Equal => None,
+                std::cmp::Ordering::Greater => Some(TileId::new(index - 1)),
+            }
+        });
+    }
+
+    fn set_tile_name(&mut self, tile: TileId, name: String) {
+        if let Some(value) = self.tiles.get_mut(tile) {
+            value.payload.name = name;
+        }
+    }
+
+    fn set_tile_color(&mut self, tile: TileId, color: [u8; 3]) {
+        if let Some(value) = self.tiles.get_mut(tile) {
+            value.payload.color = color;
+        }
+    }
+
+    fn set_tile_socket(&mut self, tile: TileId, direction_index: usize, value: bool) {
+        let Some(direction) = M::Direction::ALL.get(direction_index).copied() else {
+            return;
+        };
+        let Some(entry) = self.tiles.get_mut(tile) else {
+            return;
+        };
+        let Some(socket) = entry.sockets.get_mut(direction) else {
+            return;
+        };
+        if *socket == value {
+            return;
+        }
+        *socket = value;
+        self.refresh_catalog(Some);
+    }
+
+    /// Re-derives variants after a catalog edit and reconciles enable/disable
+    /// toggles, pins, and the pin tool by `(TileId, transform)` identity.
+    ///
+    /// `remap_tile` translates old tile IDs to their post-edit IDs (`None` if the
+    /// tile was removed); it is `Some` (identity) for edits that do not renumber.
+    fn refresh_catalog(&mut self, remap_tile: impl Fn(TileId) -> Option<TileId>) {
+        let old_variants = std::mem::take(&mut self.variants);
+        let old_enabled = std::mem::take(&mut self.enabled);
+
+        let (variants, variant_sockets) = distinct_variants::<M>(&self.tiles);
+
+        let new_index_of: HashMap<OrientedTileId<M::Transform>, usize> = variants
+            .iter()
+            .enumerate()
+            .map(|(index, variant)| (*variant, index))
+            .collect();
+
+        let old_to_new: Vec<Option<usize>> = old_variants
+            .iter()
+            .map(|variant| {
+                remap_tile(variant.tile).and_then(|tile| {
+                    new_index_of
+                        .get(&OrientedTileId::new(tile, variant.transform))
+                        .copied()
+                })
+            })
+            .collect();
+
+        let mut enabled = vec![true; variants.len()];
+        for (old_index, maybe_new) in old_to_new.iter().enumerate() {
+            if let Some(new_index) = maybe_new {
+                enabled[*new_index] = old_enabled[old_index];
+            }
+        }
+
+        for pin in self.pins.iter_mut() {
+            if let Some(old_index) = *pin {
+                *pin = old_to_new.get(old_index).copied().flatten();
+            }
+        }
+
+        if let CanvasTool::Pin(old_index) = self.tool {
+            self.tool = match old_to_new.get(old_index).copied().flatten() {
+                Some(new_index) if enabled[new_index] => CanvasTool::Pin(new_index),
+                _ => CanvasTool::Inspect,
+            };
+        }
+
+        self.variants = variants;
+        self.variant_sockets = variant_sockets;
+        self.enabled = enabled;
+        self.rebuild_wave();
+    }
+
+    fn tile_sockets(&self, tile: TileId) -> Vec<bool> {
+        self.tiles
+            .get(tile)
+            .map(|value| value.sockets.iter().map(|(_, socket)| *socket).collect())
+            .unwrap_or_default()
     }
 
     fn apply_tool(&mut self, coord: Coord2, secondary: bool) -> bool {
@@ -528,12 +654,15 @@ fn distinct_variants<M: ModeSpec>(
 
 fn insert_demo_tile<D: Direction>(
     tiles: &mut TileSet<TileStyle, D, bool>,
-    name: &'static str,
+    name: &str,
     color: [u8; 3],
     socket: impl FnMut(D) -> bool,
 ) -> TileId {
     tiles.insert(Tile::new(
-        TileStyle { name, color },
+        TileStyle {
+            name: name.to_owned(),
+            color,
+        },
         SocketMap::from_fn(socket),
     ))
 }
@@ -546,6 +675,7 @@ trait SessionAccess {
     fn variant(&self, index: usize) -> Option<VariantView>;
     fn variant_sockets(&self, index: usize) -> &[bool];
     fn variant_enabled(&self, index: usize) -> bool;
+    fn tile_sockets(&self, tile: TileId) -> Vec<bool>;
     fn variants_for_tile(&self, tile: TileId) -> Vec<usize>;
     fn enabled_variant_count(&self) -> usize;
     fn seed(&self) -> u64;
@@ -568,6 +698,11 @@ trait SessionAccess {
     fn set_seed(&mut self, seed: u64);
     fn set_tool(&mut self, tool: CanvasTool);
     fn set_variant_enabled(&mut self, index: usize, enabled: bool) -> usize;
+    fn add_tile(&mut self);
+    fn remove_tile(&mut self, tile: TileId);
+    fn set_tile_name(&mut self, tile: TileId, name: String);
+    fn set_tile_color(&mut self, tile: TileId, color: [u8; 3]);
+    fn set_tile_socket(&mut self, tile: TileId, direction_index: usize, value: bool);
     fn apply_tool(&mut self, coord: Coord2, secondary: bool) -> bool;
     fn clear_pins(&mut self) -> usize;
     fn reset_wave(&mut self);
@@ -587,11 +722,11 @@ impl<M: ModeSpec> SessionAccess for Session<M> {
     fn tiles(&self) -> Vec<(TileId, TileStyle)> {
         self.tiles
             .iter()
-            .map(|(tile, value)| (tile, value.payload))
+            .map(|(tile, value)| (tile, value.payload.clone()))
             .collect()
     }
     fn tile_style(&self, tile: TileId) -> Option<TileStyle> {
-        self.tiles.get(tile).map(|value| value.payload)
+        self.tiles.get(tile).map(|value| value.payload.clone())
     }
     fn variant(&self, index: usize) -> Option<VariantView> {
         let placement = *self.variants.get(index)?;
@@ -605,6 +740,9 @@ impl<M: ModeSpec> SessionAccess for Session<M> {
     }
     fn variant_enabled(&self, index: usize) -> bool {
         self.enabled.get(index).copied().unwrap_or(false)
+    }
+    fn tile_sockets(&self, tile: TileId) -> Vec<bool> {
+        self.tile_sockets(tile)
     }
     fn variants_for_tile(&self, tile: TileId) -> Vec<usize> {
         self.variants
@@ -675,6 +813,21 @@ impl<M: ModeSpec> SessionAccess for Session<M> {
     }
     fn set_variant_enabled(&mut self, index: usize, enabled: bool) -> usize {
         self.set_variant_enabled(index, enabled)
+    }
+    fn add_tile(&mut self) {
+        self.add_tile();
+    }
+    fn remove_tile(&mut self, tile: TileId) {
+        self.remove_tile(tile);
+    }
+    fn set_tile_name(&mut self, tile: TileId, name: String) {
+        self.set_tile_name(tile, name);
+    }
+    fn set_tile_color(&mut self, tile: TileId, color: [u8; 3]) {
+        self.set_tile_color(tile, color);
+    }
+    fn set_tile_socket(&mut self, tile: TileId, direction_index: usize, value: bool) {
+        self.set_tile_socket(tile, direction_index, value);
     }
     fn apply_tool(&mut self, coord: Coord2, secondary: bool) -> bool {
         self.apply_tool(coord, secondary)
@@ -771,6 +924,9 @@ impl EditorModel {
     pub(crate) fn variant_enabled(&self, index: usize) -> bool {
         self.active().variant_enabled(index)
     }
+    pub(crate) fn tile_sockets(&self, tile: TileId) -> Vec<bool> {
+        self.active().tile_sockets(tile)
+    }
     pub(crate) fn variants_for_tile(&self, tile: TileId) -> Vec<usize> {
         self.active().variants_for_tile(tile)
     }
@@ -836,6 +992,22 @@ impl EditorModel {
     }
     pub(crate) fn set_variant_enabled(&mut self, index: usize, enabled: bool) -> usize {
         self.active_mut().set_variant_enabled(index, enabled)
+    }
+    pub(crate) fn add_tile(&mut self) {
+        self.active_mut().add_tile();
+    }
+    pub(crate) fn remove_tile(&mut self, tile: TileId) {
+        self.active_mut().remove_tile(tile);
+    }
+    pub(crate) fn set_tile_name(&mut self, tile: TileId, name: String) {
+        self.active_mut().set_tile_name(tile, name);
+    }
+    pub(crate) fn set_tile_color(&mut self, tile: TileId, color: [u8; 3]) {
+        self.active_mut().set_tile_color(tile, color);
+    }
+    pub(crate) fn set_tile_socket(&mut self, tile: TileId, direction_index: usize, value: bool) {
+        self.active_mut()
+            .set_tile_socket(tile, direction_index, value);
     }
     pub(crate) fn apply_tool(&mut self, coord: Coord2, secondary: bool) -> bool {
         self.active_mut().apply_tool(coord, secondary)
@@ -1023,6 +1195,88 @@ mod tests {
             assert!(!model.running());
             assert_ne!(model.status(), Some(WfcStatus::Running));
         }
+    }
+
+    #[test]
+    fn adding_a_tile_appends_variants_without_disturbing_existing_pins() {
+        let mut model = EditorModel::new(Extent2::new(3, 3));
+        let corner = model.variants_for_tile(TileId::new(2))[0];
+        model.set_tool(CanvasTool::Pin(corner));
+        assert!(model.apply_tool(Coord2::ZERO, false));
+        let before = model.tiles().len();
+
+        model.add_tile();
+
+        assert_eq!(model.tiles().len(), before + 1);
+        // New variants append at the end, so existing indices and pins are stable.
+        assert_eq!(model.pin_variant_at(Coord2::ZERO), Some(corner));
+        assert_eq!(model.variants_for_tile(TileId::new(2))[0], corner);
+    }
+
+    #[test]
+    fn editing_sockets_preserves_enabled_toggles_by_identity() {
+        let mut model = EditorModel::default();
+        let before = model.variants_for_tile(TileId::new(2))[1];
+        model.set_variant_enabled(before, false);
+        assert!(!model.variant_enabled(before));
+
+        // Give Blank (tile 0) a North edge: it gains variants ahead of Corner,
+        // shifting Corner's dense indices.
+        model.set_tile_socket(TileId::new(0), 0, true);
+
+        let after = model.variants_for_tile(TileId::new(2))[1];
+        assert_ne!(
+            after, before,
+            "editing an earlier tile should shift indices"
+        );
+        assert!(
+            !model.variant_enabled(after),
+            "the disabled orientation stays disabled by identity"
+        );
+    }
+
+    #[test]
+    fn deleting_a_tile_compacts_ids_and_drops_only_its_pins() {
+        let mut model = EditorModel::new(Extent2::new(4, 4));
+        let straight = model.variants_for_tile(TileId::new(1))[0];
+        let cross = model.variants_for_tile(TileId::new(4))[0];
+        model.set_tool(CanvasTool::Pin(straight));
+        assert!(model.apply_tool(Coord2::new(0, 0), false));
+        model.set_tool(CanvasTool::Pin(cross));
+        assert!(model.apply_tool(Coord2::new(2, 2), false));
+
+        model.remove_tile(TileId::new(1));
+
+        // Straight's pin is gone; Cross's pin survives, remapped by identity.
+        assert_eq!(model.pin_variant_at(Coord2::new(0, 0)), None);
+        let cross_now = model.variants_for_tile(TileId::new(3))[0];
+        assert_eq!(model.pin_variant_at(Coord2::new(2, 2)), Some(cross_now));
+
+        // TileIds compact: Corner slides into slot 1.
+        let names: Vec<_> = model
+            .tiles()
+            .into_iter()
+            .map(|(_, style)| style.name)
+            .collect();
+        assert_eq!(names, vec!["Blank", "Corner", "T junction", "Cross"]);
+    }
+
+    #[test]
+    fn renaming_and_recoloring_leave_the_wave_untouched() {
+        let mut model = EditorModel::default();
+        model.step();
+        model.step();
+        let observations = model.observations();
+        let status = model.status();
+
+        model.set_tile_name(TileId::new(0), "Empty".to_owned());
+        model.set_tile_color(TileId::new(0), [1, 2, 3]);
+
+        assert_eq!(model.observations(), observations);
+        assert_eq!(model.status(), status);
+        let style = model.tile_style(TileId::new(0)).unwrap();
+        assert_eq!(style.name, "Empty");
+        assert_eq!(style.color, [1, 2, 3]);
     }
 
     #[test]

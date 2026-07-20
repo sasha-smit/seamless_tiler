@@ -6,12 +6,11 @@ use eframe::egui::{
     StrokeKind, Vec2,
 };
 use seamless_tiler::{
-    AxisBoundaries, Boundary, CellId, Coord2, Extent2, QuarterTurns, SixthTurns, WfcStatus,
+    AxisBoundaries, Boundary, CellId, Coord2, Extent2, QuarterTurns, SixthTurns, TileId, WfcStatus,
 };
 
 use crate::model::{
     CanvasTool, CellVisual, DEFAULT_EXTENT, EditorModel, GridMode, MAX_DIMENSION, Orientation,
-    TileStyle,
 };
 
 const DEFAULT_CELL_SIZE: f32 = 52.0;
@@ -96,6 +95,8 @@ impl TilerApp {
         self.show_topology_controls(ui);
         ui.separator();
         self.show_solver_controls(ui);
+        ui.separator();
+        self.show_tile_catalog(ui);
         ui.separator();
         self.show_variant_palette(ui);
         ui.separator();
@@ -243,6 +244,50 @@ impl TilerApp {
         ui.colored_label(color, text);
     }
 
+    fn show_tile_catalog(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Tile catalog");
+        ui.weak("Edit name, color, and edge sockets. Orientations derive below.");
+        let labels = direction_labels(self.model.mode());
+        let mut pending_delete: Option<(TileId, String)> = None;
+        for (tile_id, style) in self.model.tiles() {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let mut color = style.color;
+                if ui.color_edit_button_srgb(&mut color).changed() {
+                    self.model.set_tile_color(tile_id, color);
+                }
+                let mut name = style.name.clone();
+                if ui
+                    .add(egui::TextEdit::singleline(&mut name).desired_width(120.0))
+                    .changed()
+                {
+                    self.model.set_tile_name(tile_id, name);
+                }
+                if ui.button("Delete").clicked() {
+                    pending_delete = Some((tile_id, style.name.clone()));
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                let sockets = self.model.tile_sockets(tile_id);
+                for (index, (label, value)) in labels.iter().zip(sockets.iter()).enumerate() {
+                    let mut socket = *value;
+                    if ui.checkbox(&mut socket, *label).changed() {
+                        self.model.set_tile_socket(tile_id, index, socket);
+                    }
+                }
+            });
+        }
+        if let Some((tile_id, name)) = pending_delete {
+            self.model.remove_tile(tile_id);
+            self.notice = Some(format!("Deleted {name}"));
+        }
+        ui.add_space(4.0);
+        if ui.button("Add tile").clicked() {
+            self.model.add_tile();
+            self.notice = Some("Added a tile".to_owned());
+        }
+    }
+
     fn show_variant_palette(&mut self, ui: &mut egui::Ui) {
         ui.heading("Tile orientations");
         ui.horizontal_wrapped(|ui| {
@@ -265,7 +310,11 @@ impl TilerApp {
             .collect();
         for (_tile_id, style, variant_indices) in groups {
             ui.add_space(5.0);
-            ui.label(RichText::new(style.name).strong().color(style_color(style)));
+            ui.label(
+                RichText::new(style.name.clone())
+                    .strong()
+                    .color(style_color(style.color)),
+            );
             ui.horizontal_wrapped(|ui| {
                 for variant_index in variant_indices {
                     let mut enabled = self.model.variant_enabled(variant_index);
@@ -315,7 +364,7 @@ impl TilerApp {
         let (rect, response) = ui.allocate_exact_size(Vec2::splat(48.0), Sense::click());
         let selected = self.model.tool() == CanvasTool::Pin(variant_index);
         let fill = if enabled {
-            style_color(style)
+            style_color(style.color)
         } else {
             Color32::from_gray(42)
         };
@@ -437,7 +486,7 @@ impl TilerApp {
                             .tile_style(variant.tile)
                             .expect("variant refers to a demo tile");
                         ui.colored_label(
-                            style_color(style),
+                            style_color(style.color),
                             format!("{} {}", style.name, orientation_label(variant.orientation)),
                         );
                     }
@@ -502,7 +551,8 @@ impl TilerApp {
                     style_color(
                         self.model
                             .tile_style(variant.tile)
-                            .expect("variant refers to a demo tile"),
+                            .expect("variant refers to a demo tile")
+                            .color,
                     )
                 }
             };
@@ -636,8 +686,15 @@ fn orientation_label(orientation: Orientation) -> String {
     }
 }
 
-fn style_color(style: TileStyle) -> Color32 {
-    Color32::from_rgb(style.color[0], style.color[1], style.color[2])
+fn direction_labels(mode: GridMode) -> &'static [&'static str] {
+    match mode {
+        GridMode::Square => &["N", "E", "S", "W"],
+        GridMode::Hex => &["NE", "E", "SE", "SW", "W", "NW"],
+    }
+}
+
+fn style_color(color: [u8; 3]) -> Color32 {
+    Color32::from_rgb(color[0], color[1], color[2])
 }
 
 fn uncertainty_color(candidates: usize, total: usize) -> Color32 {
