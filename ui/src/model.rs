@@ -9,7 +9,7 @@ use seamless_tiler::{
 };
 
 #[cfg(test)]
-use crate::raster::closed_edge;
+use crate::raster::{DEFAULT_PAINT_COLOR, closed_edge};
 use crate::raster::{Raster, Rgba, generate_raster, is_closed_edge};
 
 pub(crate) const DEFAULT_EXTENT: Extent2 = Extent2::new(12, 8);
@@ -50,7 +50,6 @@ pub(crate) struct TileStyle {
 struct SquareTile {
     style: TileStyle,
     raster: Raster,
-    edge_mask: [bool; 4],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -174,7 +173,10 @@ impl ModeSpec for SquareMode {
     }
 
     fn edge_controls(tile: &Tile<Self::Payload, Self::Direction, Self::Socket>) -> Vec<bool> {
-        tile.payload.edge_mask.to_vec()
+        tile.sockets
+            .iter()
+            .map(|(_, socket)| !is_closed_edge(socket))
+            .collect()
     }
 
     fn set_edge(
@@ -182,13 +184,8 @@ impl ModeSpec for SquareMode {
         direction: Self::Direction,
         value: bool,
     ) -> bool {
-        let entry = &mut tile.payload.edge_mask[direction.index()];
-        if *entry == value {
-            return false;
-        }
-        *entry = value;
-        regenerate_square_tile(tile);
-        true
+        let _ = (tile, direction, value);
+        false
     }
 
     fn set_color(
@@ -199,7 +196,6 @@ impl ModeSpec for SquareMode {
             return false;
         }
         tile.payload.style.color = color;
-        regenerate_square_tile(tile);
         true
     }
 
@@ -377,6 +373,7 @@ struct Session<M: ModeSpec> {
     wave: Option<Wfc<M::Topology>>,
     seed: u64,
     selected_cell: Option<Coord2>,
+    selected_tile: Option<TileId>,
     tool: CanvasTool,
     running: bool,
     observations: usize,
@@ -392,6 +389,7 @@ impl<M: ModeSpec> Session<M> {
             "editor extent must be between 1 and 64"
         );
         let tiles = M::demo_tiles();
+        let selected_tile = (!tiles.is_empty()).then_some(TileId::new(0));
         let derived = distinct_variants::<M>(&tiles);
         let mut session = Self {
             pins: Grid::filled(extent, None).expect("editor dimensions have a valid area"),
@@ -406,6 +404,7 @@ impl<M: ModeSpec> Session<M> {
             wave: None,
             seed: M::default_seed(),
             selected_cell: None,
+            selected_tile,
             tool: CanvasTool::Inspect,
             running: false,
             observations: 0,
@@ -494,7 +493,7 @@ impl<M: ModeSpec> Session<M> {
 
     fn add_tile(&mut self) {
         let name = format!("Tile {}", self.tiles.len() + 1);
-        self.tiles.insert(M::new_tile(name));
+        self.selected_tile = Some(self.tiles.insert(M::new_tile(name)));
         self.refresh_catalog(Some);
     }
 
@@ -510,6 +509,13 @@ impl<M: ModeSpec> Session<M> {
             }
         }
         self.tiles = rebuilt;
+        self.selected_tile = match self.selected_tile {
+            Some(selected) if selected.index() < removed => Some(selected),
+            Some(selected) if selected.index() > removed => Some(TileId::new(selected.index() - 1)),
+            Some(_) if self.tiles.is_empty() => None,
+            Some(_) => Some(TileId::new(removed.min(self.tiles.len() - 1))),
+            None => None,
+        };
         self.refresh_catalog(|old| {
             let index = old.index();
             match index.cmp(&removed) {
@@ -524,6 +530,14 @@ impl<M: ModeSpec> Session<M> {
         if let Some(value) = self.tiles.get_mut(tile) {
             M::style_mut(&mut value.payload).name = name;
         }
+    }
+
+    fn set_selected_tile(&mut self, tile: TileId) -> bool {
+        if self.tiles.get(tile).is_none() || self.selected_tile == Some(tile) {
+            return false;
+        }
+        self.selected_tile = Some(tile);
+        true
     }
 
     fn set_tile_color(&mut self, tile: TileId, color: [u8; 3]) {
@@ -908,15 +922,41 @@ fn square_tile(
         SquareTile {
             style: TileStyle { name, color },
             raster,
-            edge_mask,
         },
         sockets,
     )
 }
 
-fn regenerate_square_tile(tile: &mut Tile<SquareTile, SquareDirection, EdgeStrip<Rgba>>) {
-    tile.payload.raster = generate_raster(&tile.payload.edge_mask, tile.payload.style.color);
-    tile.sockets = tile.payload.raster.edges();
+impl Session<SquareMode> {
+    fn selected_raster(&self) -> Option<&Raster> {
+        let tile = self.selected_tile?;
+        self.tiles.get(tile).map(|tile| &tile.payload.raster)
+    }
+
+    fn paint_selected_tile(
+        &mut self,
+        from: Coord2,
+        to: Coord2,
+        brush_size: usize,
+        color: Rgba,
+    ) -> bool {
+        let Some(tile_id) = self.selected_tile else {
+            return false;
+        };
+        let Some(tile) = self.tiles.get_mut(tile_id) else {
+            return false;
+        };
+        if !tile
+            .payload
+            .raster
+            .paint_stroke(from, to, brush_size, color)
+        {
+            return false;
+        }
+        tile.sockets = tile.payload.raster.edges();
+        self.refresh_catalog(Some);
+        true
+    }
 }
 
 fn insert_square_demo_tile(
@@ -947,6 +987,7 @@ trait SessionAccess {
     fn variants_for_tile(&self, tile: TileId) -> Vec<usize>;
     fn enabled_variant_count(&self) -> usize;
     fn seed(&self) -> u64;
+    fn selected_tile(&self) -> Option<TileId>;
     fn selected_cell(&self) -> Option<Coord2>;
     fn tool(&self) -> CanvasTool;
     fn running(&self) -> bool;
@@ -971,6 +1012,7 @@ trait SessionAccess {
     fn set_tile_name(&mut self, tile: TileId, name: String);
     fn set_tile_color(&mut self, tile: TileId, color: [u8; 3]);
     fn set_tile_socket(&mut self, tile: TileId, direction_index: usize, value: bool);
+    fn set_selected_tile(&mut self, tile: TileId) -> bool;
     fn apply_tool(&mut self, coord: Coord2, secondary: bool) -> bool;
     fn clear_pins(&mut self) -> usize;
     fn reset_wave(&mut self);
@@ -1038,6 +1080,9 @@ impl<M: ModeSpec> SessionAccess for Session<M> {
     }
     fn seed(&self) -> u64 {
         self.seed
+    }
+    fn selected_tile(&self) -> Option<TileId> {
+        self.selected_tile
     }
     fn selected_cell(&self) -> Option<Coord2> {
         self.selected_cell
@@ -1110,6 +1155,9 @@ impl<M: ModeSpec> SessionAccess for Session<M> {
     }
     fn set_tile_socket(&mut self, tile: TileId, direction_index: usize, value: bool) {
         self.set_tile_socket(tile, direction_index, value);
+    }
+    fn set_selected_tile(&mut self, tile: TileId) -> bool {
+        self.set_selected_tile(tile)
     }
     fn apply_tool(&mut self, coord: Coord2, secondary: bool) -> bool {
         self.apply_tool(coord, secondary)
@@ -1227,6 +1275,14 @@ impl EditorModel {
     pub(crate) fn seed(&self) -> u64 {
         self.active().seed()
     }
+    pub(crate) fn selected_tile(&self) -> Option<TileId> {
+        self.active().selected_tile()
+    }
+    pub(crate) fn selected_raster(&self) -> Option<&Raster> {
+        (self.mode == GridMode::Square)
+            .then(|| self.square.selected_raster())
+            .flatten()
+    }
     pub(crate) fn selected_cell(&self) -> Option<Coord2> {
         self.active().selected_cell()
     }
@@ -1299,6 +1355,21 @@ impl EditorModel {
     pub(crate) fn set_tile_socket(&mut self, tile: TileId, direction_index: usize, value: bool) {
         self.active_mut()
             .set_tile_socket(tile, direction_index, value);
+    }
+    pub(crate) fn set_selected_tile(&mut self, tile: TileId) -> bool {
+        self.active_mut().set_selected_tile(tile)
+    }
+    pub(crate) fn paint_selected_tile(
+        &mut self,
+        from: Coord2,
+        to: Coord2,
+        brush_size: usize,
+        color: Rgba,
+    ) -> bool {
+        if self.mode != GridMode::Square {
+            return false;
+        }
+        self.square.paint_selected_tile(from, to, brush_size, color)
     }
     pub(crate) fn apply_tool(&mut self, coord: Coord2, secondary: bool) -> bool {
         self.active_mut().apply_tool(coord, secondary)
@@ -1505,15 +1576,20 @@ mod tests {
     }
 
     #[test]
-    fn editing_sockets_preserves_enabled_toggles_by_identity() {
+    fn painting_preserves_enabled_toggles_by_identity() {
         let mut model = EditorModel::default();
         let before = model.variants_for_tile(TileId::new(2))[1];
         model.set_variant_enabled(before, false);
         assert!(!model.variant_enabled(before));
 
-        // Give Blank (tile 0) a North edge: it gains variants ahead of Corner,
+        // Make Blank (tile 0) asymmetric: it gains variants ahead of Corner,
         // shifting Corner's dense indices.
-        model.set_tile_socket(TileId::new(0), 0, true);
+        assert!(model.paint_selected_tile(
+            Coord2::new(3, 7),
+            Coord2::new(3, 7),
+            1,
+            [255, 0, 255, 255],
+        ));
 
         let after = model.variants_for_tile(TileId::new(2))[1];
         assert_ne!(
@@ -1570,7 +1646,7 @@ mod tests {
         let style = model.tile_style(TileId::new(0)).unwrap();
         assert_eq!(style.name, "Empty");
         assert_eq!(style.color, [1, 2, 3]);
-        assert_ne!(model.variant_raster(0).unwrap(), &raster_before);
+        assert_eq!(model.variant_raster(0).unwrap(), &raster_before);
         assert_eq!(model.square.variant_sockets[0], sockets_before);
     }
 
@@ -1581,7 +1657,12 @@ mod tests {
             assert_eq!(tile.sockets, tile.payload.raster.edges());
         }
 
-        model.set_tile_socket(TileId::new(0), SquareDirection::North.index(), true);
+        assert!(model.paint_selected_tile(
+            Coord2::new(3, 0),
+            Coord2::new(3, 0),
+            1,
+            DEFAULT_PAINT_COLOR,
+        ));
         let tile = model.square.tiles.get(TileId::new(0)).unwrap();
         assert_eq!(tile.sockets, tile.payload.raster.edges());
         assert_ne!(tile.sockets[SquareDirection::North], closed_edge());
@@ -1655,13 +1736,18 @@ mod tests {
         let mut model = EditorModel::new(Extent2::new(3, 3));
         let start = model.catalog_version();
 
-        model.set_tile_socket(TileId::new(0), 0, true);
-        let after_socket = model.catalog_version();
-        assert!(after_socket > start);
+        assert!(model.paint_selected_tile(
+            Coord2::new(3, 7),
+            Coord2::new(3, 7),
+            1,
+            DEFAULT_PAINT_COLOR,
+        ));
+        let after_paint = model.catalog_version();
+        assert!(after_paint > start);
 
         model.set_tile_color(TileId::new(0), [1, 2, 3]);
         let after_color = model.catalog_version();
-        assert!(after_color > after_socket);
+        assert!(after_color > after_paint);
 
         model.add_tile();
         let after_add = model.catalog_version();
@@ -1677,6 +1763,86 @@ mod tests {
         let variant = model.variants_for_tile(TileId::new(0))[0];
         model.set_variant_enabled(variant, false);
         assert_eq!(model.catalog_version(), after_remove);
+    }
+
+    #[test]
+    fn painting_and_erasing_edges_rebuilds_the_wave_live() {
+        let mut model = EditorModel::new(Extent2::new(3, 3));
+        model.step();
+        assert_eq!(model.observations(), 1);
+        let start_version = model.catalog_version();
+
+        assert!(model.paint_selected_tile(
+            Coord2::new(4, 0),
+            Coord2::new(4, 0),
+            1,
+            DEFAULT_PAINT_COLOR,
+        ));
+        assert_eq!(model.observations(), 0);
+        assert!(model.catalog_version() > start_version);
+        let tile = model.square.tiles.get(TileId::new(0)).unwrap();
+        assert_ne!(tile.sockets[SquareDirection::North], closed_edge());
+
+        let painted_version = model.catalog_version();
+        assert!(!model.paint_selected_tile(
+            Coord2::new(4, 0),
+            Coord2::new(4, 0),
+            1,
+            DEFAULT_PAINT_COLOR,
+        ));
+        assert_eq!(model.catalog_version(), painted_version);
+
+        assert!(model.paint_selected_tile(
+            Coord2::new(4, 0),
+            Coord2::new(4, 0),
+            1,
+            crate::raster::EDGE_BACKGROUND,
+        ));
+        let tile = model.square.tiles.get(TileId::new(0)).unwrap();
+        assert_eq!(tile.sockets[SquareDirection::North], closed_edge());
+    }
+
+    #[test]
+    fn authoring_selection_tracks_catalog_additions_and_removals() {
+        let mut model = EditorModel::default();
+        assert_eq!(model.selected_tile(), Some(TileId::new(0)));
+        assert!(model.set_selected_tile(TileId::new(2)));
+
+        model.remove_tile(TileId::new(1));
+        assert_eq!(model.selected_tile(), Some(TileId::new(1)));
+        model.remove_tile(TileId::new(1));
+        assert_eq!(model.selected_tile(), Some(TileId::new(1)));
+
+        model.add_tile();
+        assert_eq!(
+            model.selected_tile(),
+            Some(TileId::new(model.tiles().len() - 1))
+        );
+
+        while let Some(tile) = model.selected_tile() {
+            model.remove_tile(tile);
+        }
+        assert!(model.tiles().is_empty());
+        assert!(model.selected_raster().is_none());
+
+        model.add_tile();
+        assert_eq!(model.selected_tile(), Some(TileId::new(0)));
+        assert!(model.selected_raster().is_some());
+    }
+
+    #[test]
+    fn pencil_editing_is_unavailable_in_hex_mode() {
+        let mut model = EditorModel::default();
+        select_hex(&mut model);
+        let before = model.catalog_version();
+        assert!(!model.paint_selected_tile(
+            Coord2::ZERO,
+            Coord2::new(5, 5),
+            3,
+            DEFAULT_PAINT_COLOR,
+        ));
+        assert_eq!(model.catalog_version(), before);
+        assert!(model.selected_raster().is_none());
     }
 
     #[test]

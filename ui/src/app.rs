@@ -12,10 +12,12 @@ use seamless_tiler::{
 use crate::model::{
     CanvasTool, CellVisual, DEFAULT_EXTENT, EditorModel, GridMode, MAX_DIMENSION, Orientation,
 };
-use crate::raster::RASTER_SIZE;
+use crate::raster::{DEFAULT_PAINT_COLOR, EDGE_BACKGROUND, RASTER_SIZE, Raster, Rgba};
 
 const DEFAULT_CELL_SIZE: f32 = 52.0;
 const DEFAULT_STEPS_PER_SECOND: f32 = 8.0;
+const EDITOR_PIXEL_SIZE: f32 = 8.0;
+const MAX_BRUSH_SIZE: usize = 8;
 const SQRT_3: f32 = 1.732_050_8;
 
 pub struct TilerApp {
@@ -27,6 +29,16 @@ pub struct TilerApp {
     step_accumulator: f64,
     notice: Option<String>,
     raster_cache: Option<RasterCache>,
+    paint_color: Rgba,
+    brush_size: usize,
+    paint_stroke: Option<PaintStroke>,
+}
+
+#[derive(Clone, Copy)]
+struct PaintStroke {
+    tile: TileId,
+    button: PointerButton,
+    last_pixel: Coord2,
 }
 
 /// Per-variant textures for the active square catalog, rebuilt when the mode or
@@ -48,6 +60,9 @@ impl Default for TilerApp {
             step_accumulator: 0.0,
             notice: None,
             raster_cache: None,
+            paint_color: DEFAULT_PAINT_COLOR,
+            brush_size: 1,
+            paint_stroke: None,
         }
     }
 }
@@ -55,6 +70,9 @@ impl Default for TilerApp {
 impl eframe::App for TilerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.advance_playback(ui);
+        if ui.input(|input| input.pointer.any_released()) {
+            self.paint_stroke = None;
+        }
         self.ensure_rasters(ui.ctx());
 
         egui::Panel::top("instructions").show(ui, |ui| {
@@ -162,6 +180,10 @@ impl TilerApp {
         self.show_solver_controls(ui);
         ui.separator();
         self.show_tile_catalog(ui);
+        if self.model.mode() == GridMode::Square {
+            ui.separator();
+            self.show_tile_editor(ui);
+        }
         ui.separator();
         self.show_variant_palette(ui);
         ui.separator();
@@ -178,6 +200,7 @@ impl TilerApp {
             }
         });
         if self.model.set_mode(mode) {
+            self.paint_stroke = None;
             self.dimension_inputs[mode.index()] = self.model.extent();
             self.step_accumulator = 0.0;
             self.last_frame_time = ui.input(|input| input.time);
@@ -203,6 +226,7 @@ impl TilerApp {
             }
             if ui.button("Reset mode").clicked() {
                 self.model.reset_active();
+                self.paint_stroke = None;
                 *dimensions = DEFAULT_EXTENT;
                 self.notice = Some(format!("Reset {} mode", mode.label()));
             }
@@ -315,9 +339,7 @@ impl TilerApp {
     fn show_tile_catalog(&mut self, ui: &mut egui::Ui) {
         ui.heading("Tile catalog");
         ui.weak(match self.model.mode() {
-            GridMode::Square => {
-                "Edge controls regenerate the raster; border pixels drive matching."
-            }
+            GridMode::Square => "Select a tile to edit its pixels; border pixels drive matching.",
             GridMode::Hex => "Edit name, color, and edge sockets. Orientations derive below.",
         });
         let labels = direction_labels(self.model.mode());
@@ -325,6 +347,13 @@ impl TilerApp {
         for (tile_id, style) in self.model.tiles() {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
+                if self.model.mode() == GridMode::Square {
+                    let selected = self.model.selected_tile() == Some(tile_id);
+                    if ui.selectable_label(selected, "Edit").clicked() {
+                        self.model.set_selected_tile(tile_id);
+                        self.paint_stroke = None;
+                    }
+                }
                 let mut color = style.color;
                 if ui.color_edit_button_srgb(&mut color).changed() {
                     self.model.set_tile_color(tile_id, color);
@@ -340,24 +369,108 @@ impl TilerApp {
                     pending_delete = Some((tile_id, style.name.clone()));
                 }
             });
-            ui.horizontal_wrapped(|ui| {
-                let sockets = self.model.tile_sockets(tile_id);
-                for (index, (label, value)) in labels.iter().zip(sockets.iter()).enumerate() {
-                    let mut socket = *value;
-                    if ui.checkbox(&mut socket, *label).changed() {
-                        self.model.set_tile_socket(tile_id, index, socket);
+            if self.model.mode() == GridMode::Hex {
+                ui.horizontal_wrapped(|ui| {
+                    let sockets = self.model.tile_sockets(tile_id);
+                    for (index, (label, value)) in labels.iter().zip(sockets.iter()).enumerate() {
+                        let mut socket = *value;
+                        if ui.checkbox(&mut socket, *label).changed() {
+                            self.model.set_tile_socket(tile_id, index, socket);
+                        }
                     }
-                }
-            });
+                });
+            }
         }
         if let Some((tile_id, name)) = pending_delete {
             self.model.remove_tile(tile_id);
+            self.paint_stroke = None;
             self.notice = Some(format!("Deleted {name}"));
         }
         ui.add_space(4.0);
         if ui.button("Add tile").clicked() {
             self.model.add_tile();
+            self.paint_stroke = None;
             self.notice = Some("Added a tile".to_owned());
+        }
+    }
+
+    fn show_tile_editor(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Pencil editor");
+        let Some(tile_id) = self.model.selected_tile() else {
+            ui.weak("Add a square tile to begin painting.");
+            self.paint_stroke = None;
+            return;
+        };
+        let Some(style) = self.model.tile_style(tile_id) else {
+            self.paint_stroke = None;
+            return;
+        };
+        ui.label(RichText::new(style.name).strong());
+        ui.horizontal(|ui| {
+            ui.label("Paint");
+            ui.color_edit_button_srgba_unmultiplied(&mut self.paint_color);
+        });
+        ui.add(egui::Slider::new(&mut self.brush_size, 1..=MAX_BRUSH_SIZE).text("Brush pixels"));
+        ui.weak("Left-drag paints · Right-drag erases to the closed-edge background");
+
+        let editor_size = Vec2::splat(RASTER_SIZE as f32 * EDITOR_PIXEL_SIZE);
+        let (response, painter) = ui.allocate_painter(editor_size, Sense::drag());
+        let pointer = response
+            .hover_pos()
+            .or_else(|| response.interact_pointer_pos());
+        let hovered_pixel = pointer.and_then(|pointer| editor_pixel(response.rect, pointer));
+        let (primary_down, secondary_down, released) = ui.input(|input| {
+            (
+                input.pointer.button_down(PointerButton::Primary),
+                input.pointer.button_down(PointerButton::Secondary),
+                input.pointer.any_released(),
+            )
+        });
+
+        if released {
+            self.paint_stroke = None;
+        }
+        if response.is_pointer_button_down_on() {
+            if let Some(pixel) = hovered_pixel {
+                let button = if secondary_down {
+                    Some(PointerButton::Secondary)
+                } else if primary_down {
+                    Some(PointerButton::Primary)
+                } else {
+                    None
+                };
+                if let Some(button) = button {
+                    let from = self
+                        .paint_stroke
+                        .filter(|stroke| stroke.tile == tile_id && stroke.button == button)
+                        .map_or(pixel, |stroke| stroke.last_pixel);
+                    let color = if button == PointerButton::Secondary {
+                        EDGE_BACKGROUND
+                    } else {
+                        self.paint_color
+                    };
+                    if self
+                        .model
+                        .paint_selected_tile(from, pixel, self.brush_size, color)
+                    {
+                        ui.ctx().request_repaint();
+                    }
+                    self.paint_stroke = Some(PaintStroke {
+                        tile: tile_id,
+                        button,
+                        last_pixel: pixel,
+                    });
+                }
+            } else {
+                self.paint_stroke = None;
+            }
+        }
+
+        if let Some(raster) = self.model.selected_raster() {
+            paint_raster_editor(&painter, response.rect, raster);
+        }
+        if let Some(pixel) = hovered_pixel {
+            paint_brush_preview(&painter, response.rect, pixel, self.brush_size);
         }
     }
 
@@ -735,6 +848,90 @@ impl TilerApp {
     }
 }
 
+fn editor_pixel(canvas: Rect, pointer: Pos2) -> Option<Coord2> {
+    let local = pointer - canvas.min;
+    let extent = RASTER_SIZE as f32 * EDITOR_PIXEL_SIZE;
+    if local.x < 0.0 || local.y < 0.0 || local.x >= extent || local.y >= extent {
+        return None;
+    }
+    Some(Coord2::new(
+        (local.x / EDITOR_PIXEL_SIZE).floor() as i32,
+        (local.y / EDITOR_PIXEL_SIZE).floor() as i32,
+    ))
+}
+
+fn paint_raster_editor(painter: &egui::Painter, canvas: Rect, raster: &Raster) {
+    for y in 0..RASTER_SIZE {
+        for x in 0..RASTER_SIZE {
+            let min =
+                canvas.min + Vec2::new(x as f32 * EDITOR_PIXEL_SIZE, y as f32 * EDITOR_PIXEL_SIZE);
+            let rect = Rect::from_min_size(min, Vec2::splat(EDITOR_PIXEL_SIZE));
+            let checker = if (x + y) % 2 == 0 {
+                Color32::from_gray(56)
+            } else {
+                Color32::from_gray(42)
+            };
+            painter.rect_filled(rect, 0.0, checker);
+            let [red, green, blue, alpha] = raster.get(x, y);
+            painter.rect_filled(
+                rect,
+                0.0,
+                Color32::from_rgba_unmultiplied(red, green, blue, alpha),
+            );
+        }
+    }
+
+    let grid_stroke = Stroke::new(0.5, Color32::from_black_alpha(80));
+    for index in 0..=RASTER_SIZE {
+        let offset = index as f32 * EDITOR_PIXEL_SIZE;
+        painter.line_segment(
+            [
+                canvas.min + Vec2::new(offset, 0.0),
+                canvas.left_bottom() + Vec2::new(offset, 0.0),
+            ],
+            grid_stroke,
+        );
+        painter.line_segment(
+            [
+                canvas.min + Vec2::new(0.0, offset),
+                canvas.right_top() + Vec2::new(0.0, offset),
+            ],
+            grid_stroke,
+        );
+    }
+    painter.rect_stroke(
+        canvas,
+        0.0,
+        Stroke::new(1.0, Color32::from_gray(130)),
+        StrokeKind::Inside,
+    );
+}
+
+fn paint_brush_preview(painter: &egui::Painter, canvas: Rect, center: Coord2, brush_size: usize) {
+    let size = brush_size as i32;
+    let offset = (size - 1) / 2;
+    let start_x = (center.x - offset).clamp(0, RASTER_SIZE as i32);
+    let start_y = (center.y - offset).clamp(0, RASTER_SIZE as i32);
+    let end_x = (center.x - offset + size).clamp(0, RASTER_SIZE as i32);
+    let end_y = (center.y - offset + size).clamp(0, RASTER_SIZE as i32);
+    let min = canvas.min
+        + Vec2::new(
+            start_x as f32 * EDITOR_PIXEL_SIZE,
+            start_y as f32 * EDITOR_PIXEL_SIZE,
+        );
+    let max = canvas.min
+        + Vec2::new(
+            end_x as f32 * EDITOR_PIXEL_SIZE,
+            end_y as f32 * EDITOR_PIXEL_SIZE,
+        );
+    painter.rect_stroke(
+        Rect::from_min_max(min, max),
+        0.0,
+        Stroke::new(2.0, Color32::WHITE),
+        StrokeKind::Inside,
+    );
+}
+
 fn boundary_selector(ui: &mut egui::Ui, label: &str, boundary: &mut Boundary) {
     ui.horizontal(|ui| {
         ui.label(label);
@@ -1043,6 +1240,24 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn editor_pointer_coordinates_reject_the_far_edges() {
+        let canvas = Rect::from_min_size(
+            Pos2::new(10.0, 20.0),
+            Vec2::splat(RASTER_SIZE as f32 * EDITOR_PIXEL_SIZE),
+        );
+        assert_eq!(
+            editor_pixel(canvas, Pos2::new(10.0, 20.0)),
+            Some(Coord2::ZERO)
+        );
+        assert_eq!(
+            editor_pixel(canvas, Pos2::new(265.9, 275.9)),
+            Some(Coord2::new(31, 31))
+        );
+        assert_eq!(editor_pixel(canvas, Pos2::new(266.0, 20.0)), None);
+        assert_eq!(editor_pixel(canvas, Pos2::new(10.0, 276.0)), None);
     }
 
     #[test]

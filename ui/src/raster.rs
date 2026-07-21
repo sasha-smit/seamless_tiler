@@ -2,7 +2,7 @@ use seamless_tiler::{Coord2, D4, EdgeStrip, Extent2, Grid, SocketMap, SquareDire
 
 pub(crate) const RASTER_SIZE: usize = 32;
 pub(crate) const EDGE_BACKGROUND: Rgba = [24, 27, 31, 255];
-const EDGE_PATH: Rgba = [240, 240, 240, 255];
+pub(crate) const DEFAULT_PAINT_COLOR: Rgba = [240, 240, 240, 255];
 
 pub(crate) type Rgba = [u8; 4];
 
@@ -26,6 +26,74 @@ impl Raster {
 
     pub(crate) fn set(&mut self, x: usize, y: usize, color: Rgba) {
         self.pixels[Coord2::new(x as i32, y as i32)] = color;
+    }
+
+    /// Paints a continuous line of square brush impressions.
+    ///
+    /// Brush impressions are clipped to the raster. Even-sized brushes are
+    /// biased toward positive coordinates so the pointer's pixel remains the
+    /// upper-left member of the central pair.
+    pub(crate) fn paint_stroke(
+        &mut self,
+        from: Coord2,
+        to: Coord2,
+        brush_size: usize,
+        color: Rgba,
+    ) -> bool {
+        let extent = Extent2::new(RASTER_SIZE, RASTER_SIZE);
+        if brush_size == 0
+            || brush_size > RASTER_SIZE
+            || !extent.contains(from)
+            || !extent.contains(to)
+        {
+            return false;
+        }
+
+        let mut changed = false;
+        let mut x = from.x;
+        let mut y = from.y;
+        let dx = (to.x - from.x).abs();
+        let step_x = if from.x < to.x { 1 } else { -1 };
+        let dy = -(to.y - from.y).abs();
+        let step_y = if from.y < to.y { 1 } else { -1 };
+        let mut error = dx + dy;
+
+        loop {
+            changed |= self.paint_brush(Coord2::new(x, y), brush_size, color);
+            if x == to.x && y == to.y {
+                break;
+            }
+            let doubled_error = error * 2;
+            if doubled_error >= dy {
+                error += dy;
+                x += step_x;
+            }
+            if doubled_error <= dx {
+                error += dx;
+                y += step_y;
+            }
+        }
+        changed
+    }
+
+    fn paint_brush(&mut self, center: Coord2, brush_size: usize, color: Rgba) -> bool {
+        let Ok(size) = i32::try_from(brush_size) else {
+            return false;
+        };
+        let offset = (size - 1) / 2;
+        let mut changed = false;
+        for y in center.y - offset..center.y - offset + size {
+            for x in center.x - offset..center.x - offset + size {
+                let Some(pixel) = self.pixels.get_mut(Coord2::new(x, y)) else {
+                    continue;
+                };
+                if *pixel != color {
+                    *pixel = color;
+                    changed = true;
+                }
+            }
+        }
+        changed
     }
 
     pub(crate) fn bytes(&self) -> Vec<u8> {
@@ -110,7 +178,7 @@ pub(crate) fn generate_raster(edge_mask: &[bool; 4], color: [u8; 3]) -> Raster {
                 }
             }
             if on_path {
-                raster.set(x, y, EDGE_PATH);
+                raster.set(x, y, DEFAULT_PAINT_COLOR);
             }
         }
     }
@@ -215,5 +283,47 @@ mod tests {
         let turn = D4::new(QuarterTurns::One, false);
         assert!(!turn.reverses_edge(SquareDirection::North));
         assert!(turn.reverses_edge(SquareDirection::East));
+    }
+
+    #[test]
+    fn stroke_interpolates_between_pointer_samples() {
+        let mut raster = Raster::filled(EDGE_BACKGROUND);
+        assert!(raster.paint_stroke(Coord2::new(2, 3), Coord2::new(8, 6), 1, DEFAULT_PAINT_COLOR,));
+
+        let painted: Vec<_> = raster
+            .pixels
+            .cells()
+            .filter_map(|(coord, pixel)| (*pixel == DEFAULT_PAINT_COLOR).then_some(coord))
+            .collect();
+        assert_eq!(painted.len(), 7);
+        assert_eq!(painted.first(), Some(&Coord2::new(2, 3)));
+        assert_eq!(painted.last(), Some(&Coord2::new(8, 6)));
+        for pair in painted.windows(2) {
+            let dx = pair[1].x - pair[0].x;
+            let dy = pair[1].y - pair[0].y;
+            assert!(dx.abs() <= 1 && dy.abs() <= 1);
+        }
+    }
+
+    #[test]
+    fn brush_footprints_clip_at_raster_edges() {
+        let mut raster = Raster::filled(EDGE_BACKGROUND);
+        assert!(raster.paint_stroke(Coord2::ZERO, Coord2::ZERO, 4, DEFAULT_PAINT_COLOR,));
+
+        let painted = raster
+            .pixels
+            .iter()
+            .filter(|pixel| **pixel == DEFAULT_PAINT_COLOR)
+            .count();
+        assert_eq!(painted, 9);
+        assert_eq!(raster.get(2, 2), DEFAULT_PAINT_COLOR);
+        assert_eq!(raster.get(3, 0), EDGE_BACKGROUND);
+    }
+
+    #[test]
+    fn identical_and_zero_sized_strokes_are_no_ops() {
+        let mut raster = Raster::filled(EDGE_BACKGROUND);
+        assert!(!raster.paint_stroke(Coord2::ZERO, Coord2::ZERO, 1, EDGE_BACKGROUND));
+        assert!(!raster.paint_stroke(Coord2::ZERO, Coord2::new(4, 4), 0, DEFAULT_PAINT_COLOR,));
     }
 }
