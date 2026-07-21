@@ -10,7 +10,9 @@ use seamless_tiler::{
 
 #[cfg(test)]
 use crate::raster::{DEFAULT_PAINT_COLOR, closed_edge};
-use crate::raster::{RASTER_SIZE, Raster, Rgba, generate_raster, is_closed_edge};
+use crate::raster::{
+    Rgba, SQUARE_RASTER_SIZE, SquareRaster, VariantImage, generate_raster, is_closed_edge,
+};
 
 pub(crate) const DEFAULT_EXTENT: Extent2 = Extent2::new(12, 8);
 pub(crate) const MAX_DIMENSION: usize = 64;
@@ -49,7 +51,7 @@ pub(crate) struct TileStyle {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct SquareTile {
     style: TileStyle,
-    raster: Raster,
+    raster: SquareRaster,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -129,10 +131,10 @@ trait ModeSpec: 'static {
         left: Self::Transform,
         right: Self::Transform,
     ) -> bool;
-    fn variant_raster(
+    fn variant_image(
         tile: &Tile<Self::Payload, Self::Direction, Self::Socket>,
         transform: Self::Transform,
-    ) -> Option<Raster>;
+    ) -> Option<VariantImage>;
     fn socket_active(socket: &Self::Socket) -> bool;
     fn default_seed() -> u64;
 }
@@ -233,11 +235,16 @@ impl ModeSpec for SquareMode {
         tile.payload.raster.transformed(left) == tile.payload.raster.transformed(right)
     }
 
-    fn variant_raster(
+    fn variant_image(
         tile: &Tile<Self::Payload, Self::Direction, Self::Socket>,
         transform: Self::Transform,
-    ) -> Option<Raster> {
-        Some(tile.payload.raster.transformed(transform))
+    ) -> Option<VariantImage> {
+        Some(
+            tile.payload
+                .raster
+                .transformed(transform)
+                .to_variant_image(),
+        )
     }
 
     fn socket_active(socket: &Self::Socket) -> bool {
@@ -358,10 +365,10 @@ impl ModeSpec for HexMode {
         })
     }
 
-    fn variant_raster(
+    fn variant_image(
         _tile: &Tile<Self::Payload, Self::Direction, Self::Socket>,
         _transform: Self::Transform,
-    ) -> Option<Raster> {
+    ) -> Option<VariantImage> {
         None
     }
 
@@ -381,7 +388,7 @@ struct Session<M: ModeSpec> {
     tiles: TileSet<M::Payload, M::Direction, M::Socket>,
     variants: Vec<OrientedTileId<M::Transform>>,
     variant_sockets: Vec<Vec<M::Socket>>,
-    variant_rasters: Vec<Option<Raster>>,
+    variant_images: Vec<Option<VariantImage>>,
     enabled: Vec<bool>,
     pattern_variants: Vec<usize>,
     wave: Option<Wfc<M::Topology>>,
@@ -413,7 +420,7 @@ impl<M: ModeSpec> Session<M> {
             tiles,
             variants: derived.variants,
             variant_sockets: derived.sockets,
-            variant_rasters: derived.rasters,
+            variant_images: derived.images,
             pattern_variants: Vec::new(),
             wave: None,
             seed: M::default_seed(),
@@ -559,7 +566,7 @@ impl<M: ModeSpec> Session<M> {
             return;
         };
         if M::set_color(value, color) {
-            self.refresh_variant_rasters();
+            self.refresh_variant_images();
             self.version = self.version.wrapping_add(1);
         }
     }
@@ -628,7 +635,7 @@ impl<M: ModeSpec> Session<M> {
 
         self.variants = variants;
         self.variant_sockets = derived.sockets;
-        self.variant_rasters = derived.rasters;
+        self.variant_images = derived.images;
         self.enabled = enabled;
         self.version = self.version.wrapping_add(1);
         self.rebuild_wave();
@@ -641,20 +648,20 @@ impl<M: ModeSpec> Session<M> {
             .unwrap_or_default()
     }
 
-    fn refresh_variant_rasters(&mut self) {
-        self.variant_rasters = self
+    fn refresh_variant_images(&mut self) {
+        self.variant_images = self
             .variants
             .iter()
             .map(|variant| {
                 self.tiles
                     .get(variant.tile)
-                    .and_then(|tile| M::variant_raster(tile, variant.transform))
+                    .and_then(|tile| M::variant_image(tile, variant.transform))
             })
             .collect();
     }
 
-    fn variant_raster(&self, index: usize) -> Option<&Raster> {
-        self.variant_rasters.get(index).and_then(Option::as_ref)
+    fn variant_image(&self, index: usize) -> Option<&VariantImage> {
+        self.variant_images.get(index).and_then(Option::as_ref)
     }
 
     fn variant_count(&self) -> usize {
@@ -873,7 +880,7 @@ impl<M: ModeSpec> Session<M> {
 struct DerivedVariants<M: ModeSpec> {
     variants: Vec<OrientedTileId<M::Transform>>,
     sockets: Vec<Vec<M::Socket>>,
-    rasters: Vec<Option<Raster>>,
+    images: Vec<Option<VariantImage>>,
 }
 
 fn distinct_variants<M: ModeSpec>(
@@ -881,7 +888,7 @@ fn distinct_variants<M: ModeSpec>(
 ) -> DerivedVariants<M> {
     let mut variants = Vec::new();
     let mut sockets = Vec::new();
-    let mut rasters = Vec::new();
+    let mut images = Vec::new();
     for (tile_id, tile) in tiles.iter() {
         let mut representatives = Vec::new();
         for transform in M::transforms().iter().copied() {
@@ -900,13 +907,13 @@ fn distinct_variants<M: ModeSpec>(
                 .collect();
             variants.push(OrientedTileId::new(tile_id, transform));
             sockets.push(signature);
-            rasters.push(M::variant_raster(tile, transform));
+            images.push(M::variant_image(tile, transform));
         }
     }
     DerivedVariants {
         variants,
         sockets,
-        rasters,
+        images,
     }
 }
 
@@ -956,13 +963,13 @@ impl EdgeLinkIndex {
     fn new(tiles: &TileSet<SquareTile, SquareDirection, EdgeStrip<Rgba>>) -> Self {
         let families = square_edge_families(tiles);
 
-        let node_count = tiles.len() * RASTER_SIZE * RASTER_SIZE;
+        let node_count = tiles.len() * SQUARE_RASTER_SIZE * SQUARE_RASTER_SIZE;
         let mut sets = DisjointSets::new(node_count);
         for members in families.values() {
             let Some((first, first_reversed)) = members.first().copied() else {
                 continue;
             };
-            for canonical_index in 0..RASTER_SIZE {
+            for canonical_index in 0..SQUARE_RASTER_SIZE {
                 let first_index = aligned_edge_index(canonical_index, first_reversed);
                 let first_node = raster_node(first.tile, edge_pixel(first.direction, first_index));
                 for (edge, reversed_to_key) in members.iter().copied().skip(1) {
@@ -976,9 +983,13 @@ impl EdgeLinkIndex {
         let mut grouped: HashMap<usize, Vec<RasterPixel>> = HashMap::new();
         for tile_index in 0..tiles.len() {
             let tile = TileId::new(tile_index);
-            for y in 0..RASTER_SIZE {
-                for x in 0..RASTER_SIZE {
-                    if x != 0 && y != 0 && x != RASTER_SIZE - 1 && y != RASTER_SIZE - 1 {
+            for y in 0..SQUARE_RASTER_SIZE {
+                for x in 0..SQUARE_RASTER_SIZE {
+                    if x != 0
+                        && y != 0
+                        && x != SQUARE_RASTER_SIZE - 1
+                        && y != SQUARE_RASTER_SIZE - 1
+                    {
                         continue;
                     }
                     let coord = Coord2::new(x as i32, y as i32);
@@ -1097,7 +1108,7 @@ impl DisjointSets {
 
 fn aligned_edge_index(canonical_index: usize, reversed_to_key: bool) -> usize {
     if reversed_to_key {
-        RASTER_SIZE - 1 - canonical_index
+        SQUARE_RASTER_SIZE - 1 - canonical_index
     } else {
         canonical_index
     }
@@ -1106,18 +1117,20 @@ fn aligned_edge_index(canonical_index: usize, reversed_to_key: bool) -> usize {
 fn edge_pixel(direction: SquareDirection, index: usize) -> Coord2 {
     match direction {
         SquareDirection::North => Coord2::new(index as i32, 0),
-        SquareDirection::East => Coord2::new((RASTER_SIZE - 1) as i32, index as i32),
-        SquareDirection::South => Coord2::new(index as i32, (RASTER_SIZE - 1) as i32),
+        SquareDirection::East => Coord2::new((SQUARE_RASTER_SIZE - 1) as i32, index as i32),
+        SquareDirection::South => Coord2::new(index as i32, (SQUARE_RASTER_SIZE - 1) as i32),
         SquareDirection::West => Coord2::new(0, index as i32),
     }
 }
 
 fn raster_node(tile: TileId, coord: Coord2) -> usize {
-    tile.index() * RASTER_SIZE * RASTER_SIZE + coord.y as usize * RASTER_SIZE + coord.x as usize
+    tile.index() * SQUARE_RASTER_SIZE * SQUARE_RASTER_SIZE
+        + coord.y as usize * SQUARE_RASTER_SIZE
+        + coord.x as usize
 }
 
 impl Session<SquareMode> {
-    fn selected_raster(&self) -> Option<&Raster> {
+    fn selected_raster(&self) -> Option<&SquareRaster> {
         let tile = self.selected_tile?;
         self.tiles.get(tile).map(|tile| &tile.payload.raster)
     }
@@ -1256,7 +1269,7 @@ trait SessionAccess {
     fn tile_style(&self, tile: TileId) -> Option<TileStyle>;
     fn variant(&self, index: usize) -> Option<VariantView>;
     fn variant_sockets(&self, index: usize) -> Vec<bool>;
-    fn variant_raster(&self, index: usize) -> Option<&Raster>;
+    fn variant_image(&self, index: usize) -> Option<&VariantImage>;
     fn variant_enabled(&self, index: usize) -> bool;
     fn tile_sockets(&self, tile: TileId) -> Vec<bool>;
     fn variant_count(&self) -> usize;
@@ -1330,8 +1343,8 @@ impl<M: ModeSpec> SessionAccess for Session<M> {
             .map(|sockets| sockets.iter().map(M::socket_active).collect())
             .unwrap_or_default()
     }
-    fn variant_raster(&self, index: usize) -> Option<&Raster> {
-        self.variant_raster(index)
+    fn variant_image(&self, index: usize) -> Option<&VariantImage> {
+        self.variant_image(index)
     }
     fn variant_enabled(&self, index: usize) -> bool {
         self.enabled.get(index).copied().unwrap_or(false)
@@ -1528,8 +1541,8 @@ impl EditorModel {
     pub(crate) fn variant_sockets(&self, index: usize) -> Vec<bool> {
         self.active().variant_sockets(index)
     }
-    pub(crate) fn variant_raster(&self, index: usize) -> Option<&Raster> {
-        self.active().variant_raster(index)
+    pub(crate) fn variant_image(&self, index: usize) -> Option<&VariantImage> {
+        self.active().variant_image(index)
     }
     pub(crate) fn variant_enabled(&self, index: usize) -> bool {
         self.active().variant_enabled(index)
@@ -1555,7 +1568,7 @@ impl EditorModel {
     pub(crate) fn selected_tile(&self) -> Option<TileId> {
         self.active().selected_tile()
     }
-    pub(crate) fn selected_raster(&self) -> Option<&Raster> {
+    pub(crate) fn selected_raster(&self) -> Option<&SquareRaster> {
         (self.mode == GridMode::Square)
             .then(|| self.square.selected_raster())
             .flatten()
@@ -1706,8 +1719,13 @@ mod tests {
     }
 
     fn patterned_edge(seed: u8) -> Vec<Rgba> {
-        let mut edge = vec![crate::raster::EDGE_BACKGROUND; RASTER_SIZE];
-        for (index, pixel) in edge.iter_mut().enumerate().take(RASTER_SIZE - 1).skip(1) {
+        let mut edge = vec![crate::raster::EDGE_BACKGROUND; SQUARE_RASTER_SIZE];
+        for (index, pixel) in edge
+            .iter_mut()
+            .enumerate()
+            .take(SQUARE_RASTER_SIZE - 1)
+            .skip(1)
+        {
             *pixel = [seed, index as u8, seed.wrapping_add(index as u8), 255];
         }
         edge
@@ -1718,7 +1736,7 @@ mod tests {
         direction: SquareDirection,
         samples: &[Rgba],
     ) {
-        assert_eq!(samples.len(), RASTER_SIZE);
+        assert_eq!(samples.len(), SQUARE_RASTER_SIZE);
         for (index, color) in samples.iter().copied().enumerate() {
             let coord = edge_pixel(direction, index);
             tile.payload
@@ -1764,6 +1782,19 @@ mod tests {
             .map(|(tile, _)| model.variants_for_tile(tile).len())
             .collect();
         assert_eq!(hex_counts, vec![1, 3, 6, 2, 1]);
+    }
+
+    #[test]
+    fn hex_mode_remains_image_free_during_the_raster_foundation() {
+        let mut model = EditorModel::default();
+        select_hex(&mut model);
+        assert!((0..model.variant_count()).all(|index| model.variant_image(index).is_none()));
+        assert!(
+            model
+                .tiles()
+                .into_iter()
+                .any(|(tile, _)| { model.tile_sockets(tile).into_iter().any(|socket| socket) })
+        );
     }
 
     #[test]
@@ -1972,7 +2003,7 @@ mod tests {
         model.step();
         let observations = model.observations();
         let status = model.status();
-        let raster_before = model.variant_raster(0).cloned().unwrap();
+        let raster_before = model.variant_image(0).cloned().unwrap();
         let sockets_before = model.square.variant_sockets[0].clone();
 
         model.set_tile_name(TileId::new(0), "Empty".to_owned());
@@ -1983,7 +2014,7 @@ mod tests {
         let style = model.tile_style(TileId::new(0)).unwrap();
         assert_eq!(style.name, "Empty");
         assert_eq!(style.color, [1, 2, 3]);
-        assert_eq!(model.variant_raster(0).unwrap(), &raster_before);
+        assert_eq!(model.variant_image(0).unwrap(), &raster_before);
         assert_eq!(model.square.variant_sockets[0], sockets_before);
     }
 
@@ -2028,7 +2059,7 @@ mod tests {
             second
                 .payload
                 .raster
-                .get(RASTER_SIZE - 1, RASTER_SIZE - 1 - 5),
+                .get(SQUARE_RASTER_SIZE - 1, SQUARE_RASTER_SIZE - 1 - 5),
             color
         );
         assert_eq!(
@@ -2200,7 +2231,7 @@ mod tests {
     fn conflicting_linked_corner_copy_is_rejected_atomically() {
         let mut source_pattern = patterned_edge(20);
         source_pattern[0] = [255, 0, 0, 255];
-        source_pattern[RASTER_SIZE - 1] = [0, 0, 255, 255];
+        source_pattern[SQUARE_RASTER_SIZE - 1] = [0, 0, 255, 255];
         let mut source = square_tile("Source".to_owned(), [80, 80, 80], [false; 4]);
         set_square_edge(&mut source, SquareDirection::North, &source_pattern);
         let target = square_tile("Target".to_owned(), [90, 90, 90], [false; 4]);
@@ -2237,7 +2268,7 @@ mod tests {
         let derived = distinct_variants::<SquareMode>(&tiles);
         assert_eq!(derived.variants.len(), 8);
         let distinct = derived
-            .rasters
+            .images
             .into_iter()
             .flatten()
             .collect::<std::collections::HashSet<_>>();

@@ -14,7 +14,7 @@ use crate::model::{
     CanvasTool, CellVisual, DEFAULT_EXTENT, EdgeCopyResult, EditorModel, GridMode, MAX_DIMENSION,
     Orientation, SquareEdgeRef,
 };
-use crate::raster::{DEFAULT_PAINT_COLOR, EDGE_BACKGROUND, RASTER_SIZE, Raster, Rgba};
+use crate::raster::{DEFAULT_PAINT_COLOR, EDGE_BACKGROUND, Rgba, SQUARE_RASTER_SIZE, SquareRaster};
 
 const DEFAULT_CELL_SIZE: f32 = 52.0;
 const DEFAULT_STEPS_PER_SECOND: f32 = 8.0;
@@ -30,7 +30,7 @@ pub struct TilerApp {
     last_frame_time: f64,
     step_accumulator: f64,
     notice: Option<String>,
-    raster_cache: Option<RasterCache>,
+    texture_cache: Option<VariantTextureCache>,
     paint_color: Rgba,
     brush_size: usize,
     paint_stroke: Option<PaintStroke>,
@@ -46,9 +46,10 @@ struct PaintStroke {
     last_pixel: Coord2,
 }
 
-/// Per-variant textures for the active square catalog, rebuilt when the mode or
-/// catalog version changes. Empty in hex mode, which renders flat fill + stubs.
-struct RasterCache {
+/// Per-variant textures for the active catalog, rebuilt when the mode or
+/// catalog version changes. Hex entries remain empty until hex rasters become
+/// authoritative.
+struct VariantTextureCache {
     mode: GridMode,
     version: u64,
     textures: Vec<Option<TextureHandle>>,
@@ -64,7 +65,7 @@ impl Default for TilerApp {
             last_frame_time: 0.0,
             step_accumulator: 0.0,
             notice: None,
-            raster_cache: None,
+            texture_cache: None,
             paint_color: DEFAULT_PAINT_COLOR,
             brush_size: 1,
             paint_stroke: None,
@@ -81,7 +82,7 @@ impl eframe::App for TilerApp {
         if ui.input(|input| input.pointer.any_released()) {
             self.paint_stroke = None;
         }
-        self.ensure_rasters(ui.ctx());
+        self.ensure_textures(ui.ctx());
 
         egui::Panel::top("instructions").show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -127,24 +128,20 @@ impl TilerApp {
         ui.ctx().request_repaint_after(Duration::from_millis(16));
     }
 
-    fn ensure_rasters(&mut self, ctx: &egui::Context) {
+    fn ensure_textures(&mut self, ctx: &egui::Context) {
         let mode = self.model.mode();
         let version = self.model.catalog_version();
         if self
-            .raster_cache
+            .texture_cache
             .as_ref()
             .is_some_and(|cache| cache.mode == mode && cache.version == version)
         {
             return;
         }
-        let textures = if mode == GridMode::Square {
-            (0..self.model.variant_count())
-                .map(|index| self.build_variant_texture(ctx, index))
-                .collect()
-        } else {
-            Vec::new()
-        };
-        self.raster_cache = Some(RasterCache {
+        let textures = (0..self.model.variant_count())
+            .map(|index| self.build_variant_texture(ctx, index))
+            .collect();
+        self.texture_cache = Some(VariantTextureCache {
             mode,
             version,
             textures,
@@ -152,14 +149,14 @@ impl TilerApp {
     }
 
     fn build_variant_texture(&self, ctx: &egui::Context, index: usize) -> Option<TextureHandle> {
-        let raster = self.model.variant_raster(index)?;
-        let image = ColorImage::from_rgba_unmultiplied([RASTER_SIZE, RASTER_SIZE], &raster.bytes());
+        let variant = self.model.variant_image(index)?;
+        let image = ColorImage::from_rgba_unmultiplied(variant.size(), variant.rgba());
         Some(ctx.load_texture(format!("variant-{index}"), image, TextureOptions::NEAREST))
     }
 
     /// The cached texture for a variant in the active square catalog, if any.
     fn variant_texture(&self, index: usize) -> Option<&TextureHandle> {
-        self.raster_cache
+        self.texture_cache
             .as_ref()
             .filter(|cache| cache.mode == self.model.mode())
             .and_then(|cache| cache.textures.get(index))
@@ -463,7 +460,7 @@ impl TilerApp {
             .unwrap_or([false; 4]);
         self.show_edge_assistant(ui, orphan_edges);
 
-        let editor_size = Vec2::splat(RASTER_SIZE as f32 * EDITOR_PIXEL_SIZE);
+        let editor_size = Vec2::splat(SQUARE_RASTER_SIZE as f32 * EDITOR_PIXEL_SIZE);
         let (response, painter) = ui.allocate_painter(editor_size, Sense::drag());
         let pointer = response
             .hover_pos()
@@ -995,7 +992,7 @@ impl TilerApp {
 
 fn editor_pixel(canvas: Rect, pointer: Pos2) -> Option<Coord2> {
     let local = pointer - canvas.min;
-    let extent = RASTER_SIZE as f32 * EDITOR_PIXEL_SIZE;
+    let extent = SQUARE_RASTER_SIZE as f32 * EDITOR_PIXEL_SIZE;
     if local.x < 0.0 || local.y < 0.0 || local.x >= extent || local.y >= extent {
         return None;
     }
@@ -1005,9 +1002,9 @@ fn editor_pixel(canvas: Rect, pointer: Pos2) -> Option<Coord2> {
     ))
 }
 
-fn paint_raster_editor(painter: &egui::Painter, canvas: Rect, raster: &Raster) {
-    for y in 0..RASTER_SIZE {
-        for x in 0..RASTER_SIZE {
+fn paint_raster_editor(painter: &egui::Painter, canvas: Rect, raster: &SquareRaster) {
+    for y in 0..SQUARE_RASTER_SIZE {
+        for x in 0..SQUARE_RASTER_SIZE {
             let min =
                 canvas.min + Vec2::new(x as f32 * EDITOR_PIXEL_SIZE, y as f32 * EDITOR_PIXEL_SIZE);
             let rect = Rect::from_min_size(min, Vec2::splat(EDITOR_PIXEL_SIZE));
@@ -1027,7 +1024,7 @@ fn paint_raster_editor(painter: &egui::Painter, canvas: Rect, raster: &Raster) {
     }
 
     let grid_stroke = Stroke::new(0.5, Color32::from_black_alpha(80));
-    for index in 0..=RASTER_SIZE {
+    for index in 0..=SQUARE_RASTER_SIZE {
         let offset = index as f32 * EDITOR_PIXEL_SIZE;
         painter.line_segment(
             [
@@ -1084,10 +1081,10 @@ fn paint_orphan_edges(painter: &egui::Painter, canvas: Rect, orphan_edges: [bool
 fn paint_brush_preview(painter: &egui::Painter, canvas: Rect, center: Coord2, brush_size: usize) {
     let size = brush_size as i32;
     let offset = (size - 1) / 2;
-    let start_x = (center.x - offset).clamp(0, RASTER_SIZE as i32);
-    let start_y = (center.y - offset).clamp(0, RASTER_SIZE as i32);
-    let end_x = (center.x - offset + size).clamp(0, RASTER_SIZE as i32);
-    let end_y = (center.y - offset + size).clamp(0, RASTER_SIZE as i32);
+    let start_x = (center.x - offset).clamp(0, SQUARE_RASTER_SIZE as i32);
+    let start_y = (center.y - offset).clamp(0, SQUARE_RASTER_SIZE as i32);
+    let end_x = (center.x - offset + size).clamp(0, SQUARE_RASTER_SIZE as i32);
+    let end_y = (center.y - offset + size).clamp(0, SQUARE_RASTER_SIZE as i32);
     let min = canvas.min
         + Vec2::new(
             start_x as f32 * EDITOR_PIXEL_SIZE,
@@ -1433,7 +1430,7 @@ mod tests {
     fn editor_pointer_coordinates_reject_the_far_edges() {
         let canvas = Rect::from_min_size(
             Pos2::new(10.0, 20.0),
-            Vec2::splat(RASTER_SIZE as f32 * EDITOR_PIXEL_SIZE),
+            Vec2::splat(SQUARE_RASTER_SIZE as f32 * EDITOR_PIXEL_SIZE),
         );
         assert_eq!(
             editor_pixel(canvas, Pos2::new(10.0, 20.0)),
