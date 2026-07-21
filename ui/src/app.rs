@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::f32::consts::PI;
 use std::time::Duration;
 
@@ -11,15 +12,19 @@ use seamless_tiler::{
 };
 
 use crate::model::{
-    CanvasTool, CellVisual, DEFAULT_EXTENT, EdgeCopyResult, EditorModel, GridMode, MAX_DIMENSION,
-    Orientation, SquareEdgeRef,
+    CanvasTool, CellVisual, DEFAULT_EXTENT, EdgeCopyResult, EditableRaster, EditorModel, GridMode,
+    MAX_DIMENSION, Orientation, SquareEdgeRef,
 };
-use crate::raster::{DEFAULT_PAINT_COLOR, EDGE_BACKGROUND, Rgba, SQUARE_RASTER_SIZE, SquareRaster};
+use crate::raster::{
+    DEFAULT_PAINT_COLOR, EDGE_BACKGROUND, HexRaster, Rgba, SQUARE_RASTER_SIZE, SquareRaster,
+};
 
 const DEFAULT_CELL_SIZE: f32 = 52.0;
 const DEFAULT_STEPS_PER_SECOND: f32 = 8.0;
 const EDITOR_PIXEL_SIZE: f32 = 8.0;
 const MAX_BRUSH_SIZE: usize = 8;
+const MAX_HEX_BRUSH_SIZE: usize = 6;
+const HEX_EDITOR_HEIGHT: f32 = 288.0;
 const SQRT_3: f32 = 1.732_050_8;
 
 pub struct TilerApp {
@@ -31,8 +36,9 @@ pub struct TilerApp {
     step_accumulator: f64,
     notice: Option<String>,
     texture_cache: Option<VariantTextureCache>,
+    editor_texture: Option<EditorTextureCache>,
     paint_color: Rgba,
-    brush_size: usize,
+    brush_sizes: [usize; 2],
     paint_stroke: Option<PaintStroke>,
     edge_copy_source: Option<SquareEdgeRef>,
     edge_copy_target: SquareDirection,
@@ -41,9 +47,19 @@ pub struct TilerApp {
 
 #[derive(Clone, Copy)]
 struct PaintStroke {
+    mode: GridMode,
     tile: TileId,
     button: PointerButton,
-    last_pixel: Coord2,
+    last_sample: Coord2,
+}
+
+/// The selected hex tile's editor texture, rebuilt when the mode, tile, or
+/// catalog version changes.
+struct EditorTextureCache {
+    mode: GridMode,
+    tile: TileId,
+    version: u64,
+    texture: TextureHandle,
 }
 
 /// Per-variant textures for the active catalog, rebuilt when the mode or
@@ -65,8 +81,9 @@ impl Default for TilerApp {
             step_accumulator: 0.0,
             notice: None,
             texture_cache: None,
+            editor_texture: None,
             paint_color: DEFAULT_PAINT_COLOR,
-            brush_size: 1,
+            brush_sizes: [1; 2],
             paint_stroke: None,
             edge_copy_source: None,
             edge_copy_target: SquareDirection::North,
@@ -186,10 +203,8 @@ impl TilerApp {
         self.show_solver_controls(ui);
         ui.separator();
         self.show_tile_catalog(ui);
-        if self.model.mode() == GridMode::Square {
-            ui.separator();
-            self.show_tile_editor(ui);
-        }
+        ui.separator();
+        self.show_tile_editor(ui);
         ui.separator();
         self.show_variant_palette(ui);
         ui.separator();
@@ -253,10 +268,7 @@ impl TilerApp {
         if boundaries != current {
             self.model.set_boundaries(boundaries);
         }
-        ui.weak(match self.model.mode() {
-            GridMode::Square => "Bounded edges require background-only pixel strips.",
-            GridMode::Hex => "Bounded edges require background-only pixel strips.",
-        });
+        ui.weak("Bounded edges require background-only sample strips.");
     }
 
     fn show_solver_controls(&mut self, ui: &mut egui::Ui) {
@@ -346,10 +358,7 @@ impl TilerApp {
 
     fn show_tile_catalog(&mut self, ui: &mut egui::Ui) {
         ui.heading("Tile catalog");
-        ui.weak(match self.model.mode() {
-            GridMode::Square => "Select a tile to edit its pixels; border pixels drive matching.",
-            GridMode::Hex => "Edge checkboxes regenerate the raster; border pixels drive matching.",
-        });
+        ui.weak("Select a tile to edit its samples; border samples drive matching.");
         let orphan_edges = self.model.square_orphan_edges();
         if self.model.mode() == GridMode::Square {
             let count = orphan_edges
@@ -368,7 +377,6 @@ impl TilerApp {
                 );
             }
         }
-        let labels = direction_labels(self.model.mode());
         let mut pending_delete: Option<(TileId, String)> = None;
         for (tile_id, style) in self.model.tiles() {
             let tile_orphans = orphan_edges
@@ -376,12 +384,10 @@ impl TilerApp {
                 .find_map(|(candidate, edges)| (*candidate == tile_id).then_some(*edges));
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                if self.model.mode() == GridMode::Square {
-                    let selected = self.model.selected_tile() == Some(tile_id);
-                    if ui.selectable_label(selected, "Edit").clicked() {
-                        self.model.set_selected_tile(tile_id);
-                        self.paint_stroke = None;
-                    }
+                let selected = self.model.selected_tile() == Some(tile_id);
+                if ui.selectable_label(selected, "Edit").clicked() {
+                    self.model.set_selected_tile(tile_id);
+                    self.paint_stroke = None;
                 }
                 let mut color = style.color;
                 if ui.color_edit_button_srgb(&mut color).changed() {
@@ -407,17 +413,6 @@ impl TilerApp {
                     }
                 }
             });
-            if self.model.mode() == GridMode::Hex {
-                ui.horizontal_wrapped(|ui| {
-                    let sockets = self.model.tile_sockets(tile_id);
-                    for (index, (label, value)) in labels.iter().zip(sockets.iter()).enumerate() {
-                        let mut socket = *value;
-                        if ui.checkbox(&mut socket, *label).changed() {
-                            self.model.set_tile_socket(tile_id, index, socket);
-                        }
-                    }
-                });
-            }
         }
         if let Some((tile_id, name)) = pending_delete {
             self.model.remove_tile(tile_id);
@@ -436,7 +431,7 @@ impl TilerApp {
     fn show_tile_editor(&mut self, ui: &mut egui::Ui) {
         ui.heading("Pencil editor");
         let Some(tile_id) = self.model.selected_tile() else {
-            ui.weak("Add a square tile to begin painting.");
+            ui.weak("Add a tile to begin painting.");
             self.paint_stroke = None;
             return;
         };
@@ -444,13 +439,28 @@ impl TilerApp {
             self.paint_stroke = None;
             return;
         };
+        let mode = self.model.mode();
         ui.label(RichText::new(style.name).strong());
         ui.horizontal(|ui| {
             ui.label("Paint");
             ui.color_edit_button_srgba_unmultiplied(&mut self.paint_color);
         });
-        ui.add(egui::Slider::new(&mut self.brush_size, 1..=MAX_BRUSH_SIZE).text("Brush pixels"));
+        let (max_brush, brush_label) = match mode {
+            GridMode::Square => (MAX_BRUSH_SIZE, "Brush pixels"),
+            GridMode::Hex => (MAX_HEX_BRUSH_SIZE, "Brush samples"),
+        };
+        ui.add(
+            egui::Slider::new(&mut self.brush_sizes[mode.index()], 1..=max_brush).text(brush_label),
+        );
         ui.weak("Left-drag paints · Right-drag erases to the closed-edge background");
+
+        match mode {
+            GridMode::Square => self.show_square_editor(ui, tile_id),
+            GridMode::Hex => self.show_hex_editor(ui, tile_id),
+        }
+    }
+
+    fn show_square_editor(&mut self, ui: &mut egui::Ui, tile_id: TileId) {
         ui.weak("Linked border painting is active; matching and reversed edges update together.");
 
         let orphan_edges = self
@@ -463,10 +473,72 @@ impl TilerApp {
 
         let editor_size = Vec2::splat(SQUARE_RASTER_SIZE as f32 * EDITOR_PIXEL_SIZE);
         let (response, painter) = ui.allocate_painter(editor_size, Sense::drag());
-        let pointer = response
+        let hovered = self.drive_paint_stroke(ui, &response, tile_id, editor_pixel);
+
+        if let Some(EditableRaster::Square(raster)) = self.model.selected_raster() {
+            paint_raster_editor(&painter, response.rect, raster);
+            paint_orphan_edges(&painter, response.rect, orphan_edges);
+        }
+        if let Some(pixel) = hovered {
+            paint_brush_preview(
+                &painter,
+                response.rect,
+                pixel,
+                self.brush_sizes[GridMode::Square.index()],
+            );
+        }
+    }
+
+    fn show_hex_editor(&mut self, ui: &mut egui::Ui, tile_id: TileId) {
+        ui.weak("Each stroke re-extracts all six sides; partner edges do not follow yet.");
+
+        let (response, painter) = ui.allocate_painter(hex_editor_size(), Sense::drag());
+        let hovered = self.drive_paint_stroke(ui, &response, tile_id, hex_editor_sample);
+
+        self.ensure_editor_texture(ui.ctx(), tile_id);
+        if let Some(cache) = self
+            .editor_texture
+            .as_ref()
+            .filter(|cache| cache.mode == GridMode::Hex && cache.tile == tile_id)
+        {
+            painter.image(
+                cache.texture.id(),
+                response.rect,
+                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        }
+        painter.add(Shape::closed_line(
+            regular_hex_points(response.rect.center(), response.rect.height() * 0.5).to_vec(),
+            Stroke::new(1.0, Color32::from_gray(130)),
+        ));
+        if let Some(sample) = hovered {
+            paint_hex_brush_preview(
+                &painter,
+                response.rect,
+                sample,
+                self.brush_sizes[GridMode::Hex.index()],
+            );
+        }
+    }
+
+    /// Applies pointer drags to the selected tile and returns the hovered
+    /// sample, if the pointer is over one.
+    ///
+    /// `locate` maps a pointer position to an authoritative sample, so both
+    /// modes share stroke continuation, button handling, and erasure.
+    fn drive_paint_stroke(
+        &mut self,
+        ui: &egui::Ui,
+        response: &egui::Response,
+        tile: TileId,
+        locate: impl Fn(Rect, Pos2) -> Option<Coord2>,
+    ) -> Option<Coord2> {
+        let mode = self.model.mode();
+        let hovered = response
             .hover_pos()
-            .or_else(|| response.interact_pointer_pos());
-        let hovered_pixel = pointer.and_then(|pointer| editor_pixel(response.rect, pointer));
+            .or_else(|| response.interact_pointer_pos())
+            .and_then(|pointer| locate(response.rect, pointer));
         let (primary_down, secondary_down, released) = ui.input(|input| {
             (
                 input.pointer.button_down(PointerButton::Primary),
@@ -478,49 +550,69 @@ impl TilerApp {
         if released {
             self.paint_stroke = None;
         }
-        if response.is_pointer_button_down_on() {
-            if let Some(pixel) = hovered_pixel {
-                let button = if secondary_down {
-                    Some(PointerButton::Secondary)
-                } else if primary_down {
-                    Some(PointerButton::Primary)
-                } else {
-                    None
-                };
-                if let Some(button) = button {
-                    let from = self
-                        .paint_stroke
-                        .filter(|stroke| stroke.tile == tile_id && stroke.button == button)
-                        .map_or(pixel, |stroke| stroke.last_pixel);
-                    let color = if button == PointerButton::Secondary {
-                        EDGE_BACKGROUND
-                    } else {
-                        self.paint_color
-                    };
-                    if self
-                        .model
-                        .paint_selected_tile(from, pixel, self.brush_size, color)
-                    {
-                        ui.ctx().request_repaint();
-                    }
-                    self.paint_stroke = Some(PaintStroke {
-                        tile: tile_id,
-                        button,
-                        last_pixel: pixel,
-                    });
-                }
-            } else {
-                self.paint_stroke = None;
-            }
+        if !response.is_pointer_button_down_on() {
+            return hovered;
         }
+        let Some(sample) = hovered else {
+            self.paint_stroke = None;
+            return hovered;
+        };
+        let button = if secondary_down {
+            PointerButton::Secondary
+        } else if primary_down {
+            PointerButton::Primary
+        } else {
+            return hovered;
+        };
 
-        if let Some(raster) = self.model.selected_raster() {
-            paint_raster_editor(&painter, response.rect, raster);
-            paint_orphan_edges(&painter, response.rect, orphan_edges);
+        let from = self
+            .paint_stroke
+            .filter(|stroke| stroke.mode == mode && stroke.tile == tile && stroke.button == button)
+            .map_or(sample, |stroke| stroke.last_sample);
+        let color = if button == PointerButton::Secondary {
+            EDGE_BACKGROUND
+        } else {
+            self.paint_color
+        };
+        if self
+            .model
+            .paint_selected_tile(from, sample, self.brush_sizes[mode.index()], color)
+        {
+            ui.ctx().request_repaint();
         }
-        if let Some(pixel) = hovered_pixel {
-            paint_brush_preview(&painter, response.rect, pixel, self.brush_size);
+        self.paint_stroke = Some(PaintStroke {
+            mode,
+            tile,
+            button,
+            last_sample: sample,
+        });
+        hovered
+    }
+
+    /// Uploads the selected hex raster as a nearest-filtered editor texture.
+    fn ensure_editor_texture(&mut self, ctx: &egui::Context, tile: TileId) {
+        let mode = self.model.mode();
+        let version = self.model.catalog_version();
+        if self.editor_texture.as_ref().is_some_and(|cache| {
+            cache.mode == mode && cache.tile == tile && cache.version == version
+        }) {
+            return;
         }
+        let Some(EditableRaster::Hex(raster)) = self.model.selected_raster() else {
+            return;
+        };
+        let image = raster.to_variant_image();
+        let texture = ctx.load_texture(
+            "hex-editor",
+            ColorImage::from_rgba_unmultiplied(image.size(), image.rgba()),
+            TextureOptions::NEAREST,
+        );
+        self.editor_texture = Some(EditorTextureCache {
+            mode,
+            tile,
+            version,
+            texture,
+        });
     }
 
     fn show_edge_assistant(&mut self, ui: &mut egui::Ui, orphan_edges: [bool; 4]) {
@@ -1002,6 +1094,78 @@ fn editor_pixel(canvas: Rect, pointer: Pos2) -> Option<Coord2> {
     ))
 }
 
+/// The pointy-top footprint of the hex sample editor.
+fn hex_editor_size() -> Vec2 {
+    Vec2::new(hex_width(HEX_EDITOR_HEIGHT), HEX_EDITOR_HEIGHT)
+}
+
+/// Maps a pointer position to the hex sample drawn under it.
+///
+/// The canvas holds the exported image stretched to the cell's pointy-top
+/// bounds, so mapping through texels reuses `HexRaster::sample_at_texel` and is
+/// mask-aware: positions in the rect's corners fall outside the hexagon.
+fn hex_editor_sample(canvas: Rect, pointer: Pos2) -> Option<Coord2> {
+    let [width, height] = HexRaster::IMAGE_SIZE;
+    let local = pointer - canvas.min;
+    if local.x < 0.0 || local.y < 0.0 || local.x >= canvas.width() || local.y >= canvas.height() {
+        return None;
+    }
+    HexRaster::sample_at_texel(
+        (local.x / canvas.width() * width as f32).floor() as i32,
+        (local.y / canvas.height() * height as f32).floor() as i32,
+    )
+}
+
+fn hex_texel_rect(canvas: Rect, x: i32, y: i32) -> Rect {
+    let [width, height] = HexRaster::IMAGE_SIZE;
+    let size = Vec2::new(
+        canvas.width() / width as f32,
+        canvas.height() / height as f32,
+    );
+    Rect::from_min_size(
+        canvas.min + Vec2::new(x as f32 * size.x, y as f32 * size.y),
+        size,
+    )
+}
+
+/// Tints the texels owned by the samples a brush impression would cover.
+fn paint_hex_brush_preview(
+    painter: &egui::Painter,
+    canvas: Rect,
+    center: Coord2,
+    brush_size: usize,
+) {
+    let samples: HashSet<Coord2> = HexRaster::brush_samples(center, brush_size)
+        .into_iter()
+        .collect();
+    let Some(bounds) = samples
+        .iter()
+        .map(|coord| HexRaster::sample_texel(*coord))
+        .fold(None, |bounds: Option<[i32; 4]>, [x, y]| {
+            Some(match bounds {
+                // Samples own their center texel and the column to its right.
+                None => [x, x + 1, y, y],
+                Some([min_x, max_x, min_y, max_y]) => {
+                    [min_x.min(x), max_x.max(x + 1), min_y.min(y), max_y.max(y)]
+                }
+            })
+        })
+    else {
+        return;
+    };
+    for y in bounds[2]..=bounds[3] {
+        for x in bounds[0]..=bounds[1] {
+            if HexRaster::sample_at_texel(x, y).is_some_and(|coord| samples.contains(&coord)) {
+                painter.rect_filled(
+                    hex_texel_rect(canvas, x, y),
+                    0.0,
+                    Color32::from_white_alpha(70),
+                );
+            }
+        }
+    }
+}
+
 fn paint_raster_editor(painter: &egui::Painter, canvas: Rect, raster: &SquareRaster) {
     for y in 0..SQUARE_RASTER_SIZE {
         for x in 0..SQUARE_RASTER_SIZE {
@@ -1138,13 +1302,6 @@ fn orientation_label(orientation: Orientation) -> String {
         format!("{degrees}° reflected")
     } else {
         format!("{degrees}°")
-    }
-}
-
-fn direction_labels(mode: GridMode) -> &'static [&'static str] {
-    match mode {
-        GridMode::Square => &["N", "E", "S", "W"],
-        GridMode::Hex => &["NE", "E", "SE", "SW", "W", "NW"],
     }
 }
 
@@ -1428,6 +1585,37 @@ mod tests {
         );
         assert_eq!(editor_pixel(canvas, Pos2::new(266.0, 20.0)), None);
         assert_eq!(editor_pixel(canvas, Pos2::new(10.0, 276.0)), None);
+    }
+
+    #[test]
+    fn hex_editor_samples_track_the_texel_mapping_and_reject_the_corners() {
+        let canvas = Rect::from_min_size(Pos2::new(10.0, 20.0), hex_editor_size());
+        assert_eq!(
+            hex_editor_sample(canvas, canvas.center()),
+            Some(Coord2::ZERO)
+        );
+
+        let raster = HexRaster::filled(EDGE_BACKGROUND);
+        for coord in raster.coordinates() {
+            let [x, y] = HexRaster::sample_texel(coord);
+            assert_eq!(
+                hex_editor_sample(canvas, hex_texel_rect(canvas, x, y).center()),
+                Some(coord),
+                "{coord:?}",
+            );
+        }
+
+        // The rect's corners lie outside the pointy-top hexagon it contains.
+        assert_eq!(hex_editor_sample(canvas, canvas.left_top()), None);
+        assert_eq!(
+            hex_editor_sample(canvas, canvas.right_bottom() - Vec2::splat(0.5)),
+            None
+        );
+        assert_eq!(
+            hex_editor_sample(canvas, canvas.left_top() - Vec2::splat(1.0)),
+            None
+        );
+        assert_eq!(hex_editor_sample(canvas, canvas.right_bottom()), None);
     }
 
     #[test]

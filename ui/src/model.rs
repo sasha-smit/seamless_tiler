@@ -72,6 +72,13 @@ pub(crate) struct VariantView {
     pub(crate) orientation: Orientation,
 }
 
+/// The editable surface of the selected tile in the active mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EditableRaster<'a> {
+    Square(&'a SquareRaster),
+    Hex(&'a HexRaster),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct SquareEdgeRef {
     pub(crate) tile: TileId,
@@ -116,12 +123,6 @@ trait ModeSpec: 'static {
     fn new_tile(name: String) -> Tile<Self::Payload, Self::Direction, Self::Socket>;
     fn style(payload: &Self::Payload) -> &TileStyle;
     fn style_mut(payload: &mut Self::Payload) -> &mut TileStyle;
-    fn edge_controls(tile: &Tile<Self::Payload, Self::Direction, Self::Socket>) -> Vec<bool>;
-    fn set_edge(
-        tile: &mut Tile<Self::Payload, Self::Direction, Self::Socket>,
-        direction: Self::Direction,
-        value: bool,
-    ) -> bool;
     fn set_color(
         tile: &mut Tile<Self::Payload, Self::Direction, Self::Socket>,
         color: [u8; 3],
@@ -132,11 +133,6 @@ trait ModeSpec: 'static {
         world_direction: Self::Direction,
     ) -> Self::Socket;
     fn boundary_allows(socket: &Self::Socket) -> bool;
-    fn variants_equal(
-        tile: &Tile<Self::Payload, Self::Direction, Self::Socket>,
-        left: Self::Transform,
-        right: Self::Transform,
-    ) -> bool;
     fn variant_image(
         tile: &Tile<Self::Payload, Self::Direction, Self::Socket>,
         transform: Self::Transform,
@@ -193,22 +189,6 @@ impl ModeSpec for SquareMode {
         &mut payload.style
     }
 
-    fn edge_controls(tile: &Tile<Self::Payload, Self::Direction, Self::Socket>) -> Vec<bool> {
-        tile.sockets
-            .iter()
-            .map(|(_, socket)| !is_closed_edge(socket))
-            .collect()
-    }
-
-    fn set_edge(
-        tile: &mut Tile<Self::Payload, Self::Direction, Self::Socket>,
-        direction: Self::Direction,
-        value: bool,
-    ) -> bool {
-        let _ = (tile, direction, value);
-        false
-    }
-
     fn set_color(
         tile: &mut Tile<Self::Payload, Self::Direction, Self::Socket>,
         color: [u8; 3],
@@ -230,14 +210,6 @@ impl ModeSpec for SquareMode {
 
     fn boundary_allows(socket: &Self::Socket) -> bool {
         is_closed_edge(socket)
-    }
-
-    fn variants_equal(
-        tile: &Tile<Self::Payload, Self::Direction, Self::Socket>,
-        left: Self::Transform,
-        right: Self::Transform,
-    ) -> bool {
-        tile.payload.raster.transformed(left) == tile.payload.raster.transformed(right)
     }
 
     fn variant_image(
@@ -307,31 +279,6 @@ impl ModeSpec for HexMode {
         &mut payload.style
     }
 
-    fn edge_controls(tile: &Tile<Self::Payload, Self::Direction, Self::Socket>) -> Vec<bool> {
-        tile.sockets
-            .iter()
-            .map(|(_, socket)| !is_closed_edge(socket))
-            .collect()
-    }
-
-    fn set_edge(
-        tile: &mut Tile<Self::Payload, Self::Direction, Self::Socket>,
-        direction: Self::Direction,
-        value: bool,
-    ) -> bool {
-        let mut edge_mask = [false; 6];
-        for candidate in HexDirection::ALL.iter().copied() {
-            edge_mask[candidate.index()] = !is_closed_edge(&tile.sockets[candidate]);
-        }
-        if edge_mask[direction.index()] == value {
-            return false;
-        }
-        edge_mask[direction.index()] = value;
-        tile.payload.raster = generate_hex_raster(&edge_mask, tile.payload.style.color);
-        tile.sockets = tile.payload.raster.edges();
-        true
-    }
-
     fn set_color(
         tile: &mut Tile<Self::Payload, Self::Direction, Self::Socket>,
         color: [u8; 3],
@@ -353,14 +300,6 @@ impl ModeSpec for HexMode {
 
     fn boundary_allows(socket: &Self::Socket) -> bool {
         is_closed_edge(socket)
-    }
-
-    fn variants_equal(
-        tile: &Tile<Self::Payload, Self::Direction, Self::Socket>,
-        left: Self::Transform,
-        right: Self::Transform,
-    ) -> bool {
-        tile.payload.raster.transformed(left) == tile.payload.raster.transformed(right)
     }
 
     fn variant_image(
@@ -568,19 +507,6 @@ impl<M: ModeSpec> Session<M> {
         }
     }
 
-    fn set_tile_socket(&mut self, tile: TileId, direction_index: usize, value: bool) {
-        let Some(direction) = M::Direction::ALL.get(direction_index).copied() else {
-            return;
-        };
-        let Some(entry) = self.tiles.get_mut(tile) else {
-            return;
-        };
-        if !M::set_edge(entry, direction, value) {
-            return;
-        }
-        self.refresh_catalog(Some);
-    }
-
     /// Re-derives variants after a catalog edit and reconciles enable/disable
     /// toggles, pins, and the pin tool by `(TileId, transform)` identity.
     ///
@@ -636,13 +562,6 @@ impl<M: ModeSpec> Session<M> {
         self.enabled = enabled;
         self.version = self.version.wrapping_add(1);
         self.rebuild_wave();
-    }
-
-    fn tile_sockets(&self, tile: TileId) -> Vec<bool> {
-        self.tiles
-            .get(tile)
-            .map(M::edge_controls)
-            .unwrap_or_default()
     }
 
     fn refresh_variant_images(&mut self) {
@@ -889,16 +808,16 @@ fn distinct_variants<M: ModeSpec>(
     let mut sockets = Vec::new();
     let mut images = Vec::new();
     for (tile_id, tile) in tiles.iter() {
-        let mut representatives = Vec::new();
+        // A variant image holds every authoritative sample, so equal images mean
+        // equal oriented rasters. Comparing images deduplicates orientations
+        // while transforming each raster exactly once.
+        let mut representatives: Vec<VariantImage> = Vec::new();
         for transform in M::transforms().iter().copied() {
-            if representatives
-                .iter()
-                .copied()
-                .any(|representative| M::variants_equal(tile, representative, transform))
-            {
+            let image = M::variant_image(tile, transform);
+            if representatives.contains(&image) {
                 continue;
             }
-            representatives.push(transform);
+            representatives.push(image.clone());
             let signature = M::Direction::ALL
                 .iter()
                 .copied()
@@ -906,7 +825,7 @@ fn distinct_variants<M: ModeSpec>(
                 .collect();
             variants.push(OrientedTileId::new(tile_id, transform));
             sockets.push(signature);
-            images.push(M::variant_image(tile, transform));
+            images.push(image);
         }
     }
     DerivedVariants {
@@ -1249,6 +1168,72 @@ impl Session<SquareMode> {
     }
 }
 
+impl Session<HexMode> {
+    fn selected_raster(&self) -> Option<&HexRaster> {
+        let tile = self.selected_tile?;
+        self.tiles.get(tile).map(|tile| &tile.payload.raster)
+    }
+
+    fn paint_selected_tile(
+        &mut self,
+        from: Coord2,
+        to: Coord2,
+        brush_size: usize,
+        color: Rgba,
+    ) -> bool {
+        let Some(tile_id) = self.selected_tile else {
+            return false;
+        };
+        let Some(tile) = self.tiles.get(tile_id) else {
+            return false;
+        };
+        let stroke = tile.payload.raster.stroke_samples(from, to, brush_size);
+        if stroke.is_empty() {
+            return false;
+        }
+        let assignments = stroke
+            .into_iter()
+            .map(|coord| {
+                (
+                    RasterPixel {
+                        tile: tile_id,
+                        coord,
+                    },
+                    color,
+                )
+            })
+            .collect();
+        self.apply_hex_samples(assignments)
+    }
+
+    fn apply_hex_samples(&mut self, assignments: HashMap<RasterPixel, Rgba>) -> bool {
+        let mut changed_tiles = vec![false; self.tiles.len()];
+        for (sample, color) in assignments {
+            let Some(tile) = self.tiles.get_mut(sample.tile) else {
+                continue;
+            };
+            if tile.payload.raster.set_pixel(sample.coord, color) {
+                changed_tiles[sample.tile.index()] = true;
+            }
+        }
+        if !changed_tiles.iter().any(|changed| *changed) {
+            return false;
+        }
+        for (tile_index, changed) in changed_tiles.into_iter().enumerate() {
+            if !changed {
+                continue;
+            }
+            let tile = self
+                .tiles
+                .get_mut(TileId::new(tile_index))
+                .expect("changed tile remains in the catalog");
+            tile.sockets = tile.payload.raster.edges();
+        }
+        self.refresh_catalog(Some);
+        true
+    }
+}
+
 fn insert_square_demo_tile(
     tiles: &mut TileSet<SquareTile, SquareDirection, EdgeStrip<Rgba>>,
     name: &str,
@@ -1283,7 +1268,6 @@ trait SessionAccess {
     fn variant(&self, index: usize) -> Option<VariantView>;
     fn variant_image(&self, index: usize) -> Option<&VariantImage>;
     fn variant_enabled(&self, index: usize) -> bool;
-    fn tile_sockets(&self, tile: TileId) -> Vec<bool>;
     fn variant_count(&self) -> usize;
     fn catalog_version(&self) -> u64;
     fn variants_for_tile(&self, tile: TileId) -> Vec<usize>;
@@ -1313,7 +1297,6 @@ trait SessionAccess {
     fn remove_tile(&mut self, tile: TileId);
     fn set_tile_name(&mut self, tile: TileId, name: String);
     fn set_tile_color(&mut self, tile: TileId, color: [u8; 3]);
-    fn set_tile_socket(&mut self, tile: TileId, direction_index: usize, value: bool);
     fn set_selected_tile(&mut self, tile: TileId) -> bool;
     fn apply_tool(&mut self, coord: Coord2, secondary: bool) -> bool;
     fn clear_pins(&mut self) -> usize;
@@ -1354,9 +1337,6 @@ impl<M: ModeSpec> SessionAccess for Session<M> {
     }
     fn variant_enabled(&self, index: usize) -> bool {
         self.enabled.get(index).copied().unwrap_or(false)
-    }
-    fn tile_sockets(&self, tile: TileId) -> Vec<bool> {
-        self.tile_sockets(tile)
     }
     fn variant_count(&self) -> usize {
         self.variant_count()
@@ -1448,9 +1428,6 @@ impl<M: ModeSpec> SessionAccess for Session<M> {
     }
     fn set_tile_color(&mut self, tile: TileId, color: [u8; 3]) {
         self.set_tile_color(tile, color);
-    }
-    fn set_tile_socket(&mut self, tile: TileId, direction_index: usize, value: bool) {
-        self.set_tile_socket(tile, direction_index, value);
     }
     fn set_selected_tile(&mut self, tile: TileId) -> bool {
         self.set_selected_tile(tile)
@@ -1550,9 +1527,6 @@ impl EditorModel {
     pub(crate) fn variant_enabled(&self, index: usize) -> bool {
         self.active().variant_enabled(index)
     }
-    pub(crate) fn tile_sockets(&self, tile: TileId) -> Vec<bool> {
-        self.active().tile_sockets(tile)
-    }
     pub(crate) fn variant_count(&self) -> usize {
         self.active().variant_count()
     }
@@ -1571,10 +1545,12 @@ impl EditorModel {
     pub(crate) fn selected_tile(&self) -> Option<TileId> {
         self.active().selected_tile()
     }
-    pub(crate) fn selected_raster(&self) -> Option<&SquareRaster> {
-        (self.mode == GridMode::Square)
-            .then(|| self.square.selected_raster())
-            .flatten()
+    /// The selected tile's authoritative raster for the active mode, if any.
+    pub(crate) fn selected_raster(&self) -> Option<EditableRaster<'_>> {
+        match self.mode {
+            GridMode::Square => self.square.selected_raster().map(EditableRaster::Square),
+            GridMode::Hex => self.hex.selected_raster().map(EditableRaster::Hex),
+        }
     }
     pub(crate) fn square_orphan_edges(&self) -> Vec<(TileId, [bool; 4])> {
         if self.mode == GridMode::Square {
@@ -1652,13 +1628,11 @@ impl EditorModel {
     pub(crate) fn set_tile_color(&mut self, tile: TileId, color: [u8; 3]) {
         self.active_mut().set_tile_color(tile, color);
     }
-    pub(crate) fn set_tile_socket(&mut self, tile: TileId, direction_index: usize, value: bool) {
-        self.active_mut()
-            .set_tile_socket(tile, direction_index, value);
-    }
     pub(crate) fn set_selected_tile(&mut self, tile: TileId) -> bool {
         self.active_mut().set_selected_tile(tile)
     }
+    /// Paints the selected tile of the active mode, leaving the other session
+    /// untouched.
     pub(crate) fn paint_selected_tile(
         &mut self,
         from: Coord2,
@@ -1666,10 +1640,10 @@ impl EditorModel {
         brush_size: usize,
         color: Rgba,
     ) -> bool {
-        if self.mode != GridMode::Square {
-            return false;
+        match self.mode {
+            GridMode::Square => self.square.paint_selected_tile(from, to, brush_size, color),
+            GridMode::Hex => self.hex.paint_selected_tile(from, to, brush_size, color),
         }
-        self.square.paint_selected_tile(from, to, brush_size, color)
     }
     pub(crate) fn copy_selected_edge(
         &mut self,
@@ -1719,6 +1693,11 @@ mod tests {
 
     fn select_hex(model: &mut EditorModel) {
         assert!(model.set_mode(GridMode::Hex));
+    }
+
+    /// A sample on one hex border, used to prove edits reach the sockets.
+    fn hex_edge_sample(direction: HexDirection, index: usize) -> Coord2 {
+        HexRaster::edge_coordinates(direction)[index]
     }
 
     fn patterned_edge(seed: u8) -> Vec<Rgba> {
@@ -2296,27 +2275,62 @@ mod tests {
     }
 
     #[test]
-    fn hex_checkbox_edits_regenerate_raster_sockets_and_wave() {
+    fn hex_painting_updates_sockets_and_rebuilds_the_wave_live() {
         let mut model = EditorModel::default();
         select_hex(&mut model);
+        assert!(model.set_selected_tile(TileId::new(1)));
         model.step();
         assert_eq!(model.observations(), 1);
 
         let tile_id = TileId::new(1);
-        let version = model.catalog_version();
-        let raster = model.hex.tiles.get(tile_id).unwrap().payload.raster.clone();
-        model.set_tile_socket(tile_id, HexDirection::NorthEast.index(), true);
-        assert_eq!(model.catalog_version(), version);
-        assert_eq!(model.hex.tiles.get(tile_id).unwrap().payload.raster, raster);
-        assert_eq!(model.observations(), 1);
+        let border = hex_edge_sample(HexDirection::East, 5);
+        let start_version = model.catalog_version();
 
-        model.set_tile_socket(tile_id, HexDirection::East.index(), true);
+        assert!(model.paint_selected_tile(border, border, 1, DEFAULT_PAINT_COLOR));
         let tile = model.hex.tiles.get(tile_id).unwrap();
-        assert!(model.catalog_version() > version);
-        assert_ne!(tile.payload.raster, raster);
+        assert!(model.catalog_version() > start_version);
         assert_eq!(tile.sockets, tile.payload.raster.edges());
         assert_ne!(tile.sockets[HexDirection::East], closed_hex_edge());
+        assert_eq!(tile.payload.raster.get(border), Some(DEFAULT_PAINT_COLOR));
         assert_eq!(model.observations(), 0);
+
+        // Repainting the same color leaves the catalog and its textures alone.
+        let painted_version = model.catalog_version();
+        assert!(!model.paint_selected_tile(border, border, 1, DEFAULT_PAINT_COLOR));
+        assert_eq!(model.catalog_version(), painted_version);
+
+        assert!(model.paint_selected_tile(border, border, 1, crate::raster::EDGE_BACKGROUND));
+        let tile = model.hex.tiles.get(tile_id).unwrap();
+        assert_eq!(tile.sockets[HexDirection::East], closed_hex_edge());
+    }
+
+    #[test]
+    fn hex_edits_leave_the_square_session_untouched() {
+        let mut model = EditorModel::default();
+        let square_version = model.catalog_version();
+        let square_tiles = model.square.tiles.clone();
+        let square_selection = model.selected_tile();
+        assert!(matches!(
+            model.selected_raster(),
+            Some(EditableRaster::Square(_))
+        ));
+
+        select_hex(&mut model);
+        assert!(matches!(
+            model.selected_raster(),
+            Some(EditableRaster::Hex(_))
+        ));
+        assert!(model.paint_selected_tile(
+            Coord2::ZERO,
+            hex_edge_sample(HexDirection::West, 4),
+            2,
+            DEFAULT_PAINT_COLOR,
+        ));
+
+        model.set_mode(GridMode::Square);
+        assert_eq!(model.square.tiles, square_tiles);
+        assert_eq!(model.catalog_version(), square_version);
+        assert_eq!(model.selected_tile(), square_selection);
     }
 
     #[test]
@@ -2331,7 +2345,15 @@ mod tests {
         model.set_tool(CanvasTool::Pin(pinned));
         assert!(model.apply_tool(Coord2::new(2, 2), false));
 
-        model.set_tile_socket(TileId::new(0), HexDirection::NorthEast.index(), true);
+        // Painting Blank makes it asymmetric, which shifts later dense indices.
+        assert_eq!(model.selected_tile(), Some(TileId::new(0)));
+        assert!(model.paint_selected_tile(
+            hex_edge_sample(HexDirection::NorthEast, 6),
+            hex_edge_sample(HexDirection::NorthEast, 6),
+            1,
+            DEFAULT_PAINT_COLOR,
+        ));
+        assert!(model.variants_for_tile(TileId::new(0)).len() > 1);
 
         let find_variant = |view| {
             (0..model.variant_count())
@@ -2546,18 +2568,10 @@ mod tests {
     }
 
     #[test]
-    fn pencil_editing_is_unavailable_in_hex_mode() {
+    fn square_edge_assistance_stays_unavailable_in_hex_mode() {
         let mut model = EditorModel::default();
         select_hex(&mut model);
         let before = model.catalog_version();
-        assert!(!model.paint_selected_tile(
-            Coord2::ZERO,
-            Coord2::new(5, 5),
-            3,
-            DEFAULT_PAINT_COLOR,
-        ));
-        assert_eq!(model.catalog_version(), before);
-        assert!(model.selected_raster().is_none());
         assert!(model.square_orphan_edges().is_empty());
         assert_eq!(
             model.copy_selected_edge(

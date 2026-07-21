@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use seamless_tiler::{
     Coord2, D4, D6, Direction, EdgeStrip, Extent2, Grid, HexDirection, SocketMap, SquareDirection,
 };
@@ -204,6 +206,9 @@ pub(crate) struct HexRaster {
 }
 
 impl HexRaster {
+    /// The rectangular texel dimensions of the exported hex image.
+    pub(crate) const IMAGE_SIZE: [usize; 2] = [HEX_IMAGE_WIDTH, HEX_IMAGE_HEIGHT];
+
     pub(crate) fn filled(color: Rgba) -> Self {
         let extent = Extent2::new(HEX_STORAGE_SIZE, HEX_STORAGE_SIZE);
         let pixels = Grid::from_fn(extent, |storage| {
@@ -293,33 +298,119 @@ impl HexRaster {
     }
 
     pub(crate) fn to_variant_image(&self) -> VariantImage {
-        let k = HEX_EDGE_INTERVALS;
         let mut rgba = Vec::with_capacity(HEX_IMAGE_WIDTH * HEX_IMAGE_HEIGHT * 4);
         for y in 0..HEX_IMAGE_HEIGHT {
-            let r = y as i32 - 2 * k;
             for x in 0..HEX_IMAGE_WIDTH {
-                let u = x as i32 - 3 * k;
-                let inside =
-                    u.abs() <= 3 * k && (u - 3 * r).abs() <= 6 * k && (u + 3 * r).abs() <= 6 * k;
-                let pixel = inside
-                    .then(|| self.nearest_sample(u, r))
-                    .flatten()
+                let pixel = Self::sample_at_texel(x as i32, y as i32)
                     .and_then(|coord| self.get(coord))
                     .unwrap_or(TRANSPARENT);
                 rgba.extend(pixel);
             }
         }
-        VariantImage::new([HEX_IMAGE_WIDTH, HEX_IMAGE_HEIGHT], rgba)
+        VariantImage::new(Self::IMAGE_SIZE, rgba)
     }
 
-    fn nearest_sample(&self, u: i32, r: i32) -> Option<Coord2> {
-        let numerator = u - r;
-        let q_floor = numerator.div_euclid(2);
+    /// Returns the sample owning an exported texel, or `None` outside the hex.
+    ///
+    /// Texel columns are twice as dense as samples, so each sample owns the two
+    /// columns nearest its center. Export, editor hit testing, and editor
+    /// overlays share this mapping so they cannot disagree.
+    pub(crate) fn sample_at_texel(x: i32, y: i32) -> Option<Coord2> {
+        let k = i64::from(HEX_EDGE_INTERVALS);
+        let u = i64::from(x) - 3 * k;
+        let r = i64::from(y) - 2 * k;
+        if u.abs() > 3 * k || (u - 3 * r).abs() > 6 * k || (u + 3 * r).abs() > 6 * k {
+            return None;
+        }
+        let r = r as i32;
+        let u = u as i32;
+        let q_floor = (u - r).div_euclid(2);
         [q_floor, q_floor + 1]
             .into_iter()
             .map(|q| Coord2::new(q, r))
             .filter(|coord| Self::contains(*coord))
             .min_by_key(|coord| ((2 * coord.x + coord.y) - u).abs())
+    }
+
+    /// Returns the exported texel holding a sample's center.
+    pub(crate) fn sample_texel(coord: Coord2) -> [i32; 2] {
+        let k = HEX_EDGE_INTERVALS;
+        [2 * coord.x + coord.y + 3 * k, coord.y + 2 * k]
+    }
+
+    /// Returns every in-mask sample covered by one brush impression.
+    ///
+    /// Impressions are hexagonal discs of radius `brush_size - 1`, so a
+    /// single-sample brush marks only its center.
+    pub(crate) fn brush_samples(center: Coord2, brush_size: usize) -> Vec<Coord2> {
+        let Some(radius) = brush_size.checked_sub(1).and_then(|radius| {
+            i32::try_from(radius)
+                .ok()
+                .filter(|radius| *radius < HEX_EDGE_INTERVALS)
+        }) else {
+            return Vec::new();
+        };
+        let mut samples = Vec::new();
+        for dq in -radius..=radius {
+            for dr in (-radius).max(-dq - radius)..=radius.min(-dq + radius) {
+                let coord = Coord2::new(center.x + dq, center.y + dr);
+                if Self::contains(coord) {
+                    samples.push(coord);
+                }
+            }
+        }
+        samples
+    }
+
+    /// Returns every sample covered by a continuous clipped brush stroke.
+    ///
+    /// Samples appear at most once, in storage order, so callers can expand the
+    /// stroke through constraints before applying it atomically.
+    pub(crate) fn stroke_samples(
+        &self,
+        from: Coord2,
+        to: Coord2,
+        brush_size: usize,
+    ) -> Vec<Coord2> {
+        if brush_size == 0
+            || brush_size > HEX_EDGE_SAMPLES
+            || !Self::contains(from)
+            || !Self::contains(to)
+        {
+            return Vec::new();
+        }
+        let steps = hex_distance(from, to);
+        let mut covered = HashSet::new();
+        for step in 0..=steps {
+            let fraction = if steps == 0 {
+                0.0
+            } else {
+                f64::from(step) / f64::from(steps)
+            };
+            covered.extend(Self::brush_samples(
+                interpolate_sample(from, to, fraction),
+                brush_size,
+            ));
+        }
+        self.coordinates()
+            .filter(|coord| covered.contains(coord))
+            .collect()
+    }
+
+    /// Paints a continuous line of hexagonal brush impressions.
+    #[cfg(test)]
+    pub(crate) fn paint_stroke(
+        &mut self,
+        from: Coord2,
+        to: Coord2,
+        brush_size: usize,
+        color: Rgba,
+    ) -> bool {
+        let mut changed = false;
+        for coord in self.stroke_samples(from, to, brush_size) {
+            changed |= self.set_pixel(coord, color);
+        }
+        changed
     }
 
     fn axial_to_storage(coord: Coord2) -> Coord2 {
@@ -433,6 +524,29 @@ pub(crate) fn generate_hex_raster(edge_mask: &[bool; 6], color: [u8; 3]) -> HexR
     }
 
     raster
+}
+
+/// Interpolates between two axial samples in cube space.
+///
+/// Cube coordinates are `(q, -q - r, r)`; rounding restores their zero sum by
+/// recomputing whichever component moved farthest, which keeps every step of a
+/// stroke on the lattice.
+fn interpolate_sample(from: Coord2, to: Coord2, fraction: f64) -> Coord2 {
+    let x = f64::from(from.x) + (f64::from(to.x) - f64::from(from.x)) * fraction;
+    let z = f64::from(from.y) + (f64::from(to.y) - f64::from(from.y)) * fraction;
+    let y = -x - z;
+    let mut rounded_x = x.round();
+    let rounded_y = y.round();
+    let mut rounded_z = z.round();
+    let delta_x = (rounded_x - x).abs();
+    let delta_y = (rounded_y - y).abs();
+    let delta_z = (rounded_z - z).abs();
+    if delta_x > delta_y && delta_x > delta_z {
+        rounded_x = -rounded_y - rounded_z;
+    } else if delta_y <= delta_z {
+        rounded_z = -rounded_x - rounded_y;
+    }
+    Coord2::new(rounded_x as i32, rounded_z as i32)
 }
 
 fn hex_distance(left: Coord2, right: Coord2) -> i32 {
@@ -611,6 +725,91 @@ mod tests {
                 assert_eq!(pixel(x, y)[3] != 0, inside, "texel ({x}, {y})");
             }
         }
+    }
+
+    #[test]
+    fn hex_texel_mapping_round_trips_every_sample() {
+        let raster = HexRaster::filled(DEFAULT_PAINT_COLOR);
+        for coord in raster.coordinates() {
+            let [x, y] = HexRaster::sample_texel(coord);
+            assert_eq!(HexRaster::sample_at_texel(x, y), Some(coord), "{coord:?}");
+        }
+
+        let [width, height] = HexRaster::IMAGE_SIZE;
+        assert_eq!(HexRaster::sample_at_texel(0, 0), None);
+        assert_eq!(
+            HexRaster::sample_at_texel(width as i32 - 1, height as i32 - 1),
+            None
+        );
+        assert_eq!(HexRaster::sample_at_texel(i32::MIN, i32::MAX), None);
+        assert_eq!(
+            HexRaster::sample_at_texel(3 * HEX_EDGE_INTERVALS, 2 * HEX_EDGE_INTERVALS),
+            Some(Coord2::ZERO)
+        );
+    }
+
+    #[test]
+    fn hex_brush_impressions_clip_at_the_mask_boundary() {
+        assert_eq!(
+            HexRaster::brush_samples(Coord2::ZERO, 1),
+            vec![Coord2::ZERO]
+        );
+        assert_eq!(HexRaster::brush_samples(Coord2::ZERO, 0), Vec::new());
+        assert_eq!(HexRaster::brush_samples(Coord2::ZERO, 3).len(), 19);
+
+        let corner = Coord2::new(HEX_EDGE_INTERVALS, -2 * HEX_EDGE_INTERVALS);
+        let clipped = HexRaster::brush_samples(corner, 3);
+        assert!(clipped.iter().all(|coord| HexRaster::contains(*coord)));
+        assert!(clipped.contains(&corner));
+        assert!(clipped.len() < 19);
+    }
+
+    #[test]
+    fn hex_strokes_interpolate_between_pointer_samples() {
+        let raster = HexRaster::filled(EDGE_BACKGROUND);
+        let from = Coord2::new(-4, 6);
+        let to = Coord2::new(5, -3);
+        let stroke = raster.stroke_samples(from, to, 1);
+
+        let distance = hex_distance(from, to);
+        assert_eq!(stroke.len(), distance as usize + 1);
+        assert!(stroke.contains(&from));
+        assert!(stroke.contains(&to));
+        for coord in &stroke {
+            assert_eq!(
+                hex_distance(from, *coord) + hex_distance(*coord, to),
+                distance,
+                "{coord:?} leaves the interpolated line",
+            );
+        }
+
+        let mut ordered = stroke.clone();
+        ordered.sort_by_key(|coord| hex_distance(from, *coord));
+        for pair in ordered.windows(2) {
+            assert_eq!(hex_distance(pair[0], pair[1]), 1);
+        }
+    }
+
+    #[test]
+    fn identical_and_invalid_hex_strokes_are_no_ops() {
+        let mut raster = HexRaster::filled(EDGE_BACKGROUND);
+        assert!(!raster.paint_stroke(Coord2::ZERO, Coord2::ZERO, 1, EDGE_BACKGROUND));
+        assert!(raster.paint_stroke(Coord2::ZERO, Coord2::ZERO, 1, DEFAULT_PAINT_COLOR));
+        assert!(!raster.paint_stroke(Coord2::ZERO, Coord2::ZERO, 1, DEFAULT_PAINT_COLOR));
+
+        let outside = Coord2::new(0, 2 * HEX_EDGE_INTERVALS + 1);
+        assert!(raster.stroke_samples(Coord2::ZERO, outside, 1).is_empty());
+        assert!(raster.stroke_samples(outside, Coord2::ZERO, 1).is_empty());
+        assert!(
+            raster
+                .stroke_samples(Coord2::ZERO, Coord2::ZERO, 0)
+                .is_empty()
+        );
+        assert!(
+            raster
+                .stroke_samples(Coord2::ZERO, Coord2::ZERO, HEX_EDGE_SAMPLES + 1)
+                .is_empty()
+        );
     }
 
     #[test]
