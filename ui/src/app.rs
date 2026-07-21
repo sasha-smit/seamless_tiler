@@ -6,11 +6,13 @@ use eframe::egui::{
     Stroke, StrokeKind, TextureHandle, TextureOptions, Vec2,
 };
 use seamless_tiler::{
-    AxisBoundaries, Boundary, CellId, Coord2, Extent2, QuarterTurns, SixthTurns, TileId, WfcStatus,
+    AxisBoundaries, Boundary, CellId, Coord2, Direction, Extent2, QuarterTurns, SixthTurns,
+    SquareDirection, TileId, WfcStatus,
 };
 
 use crate::model::{
-    CanvasTool, CellVisual, DEFAULT_EXTENT, EditorModel, GridMode, MAX_DIMENSION, Orientation,
+    CanvasTool, CellVisual, DEFAULT_EXTENT, EdgeCopyResult, EditorModel, GridMode, MAX_DIMENSION,
+    Orientation, SquareEdgeRef,
 };
 use crate::raster::{DEFAULT_PAINT_COLOR, EDGE_BACKGROUND, RASTER_SIZE, Raster, Rgba};
 
@@ -32,6 +34,9 @@ pub struct TilerApp {
     paint_color: Rgba,
     brush_size: usize,
     paint_stroke: Option<PaintStroke>,
+    edge_copy_source: Option<SquareEdgeRef>,
+    edge_copy_target: SquareDirection,
+    reverse_edge_copy: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -63,6 +68,9 @@ impl Default for TilerApp {
             paint_color: DEFAULT_PAINT_COLOR,
             brush_size: 1,
             paint_stroke: None,
+            edge_copy_source: None,
+            edge_copy_target: SquareDirection::North,
+            reverse_edge_copy: false,
         }
     }
 }
@@ -201,6 +209,7 @@ impl TilerApp {
         });
         if self.model.set_mode(mode) {
             self.paint_stroke = None;
+            self.edge_copy_source = None;
             self.dimension_inputs[mode.index()] = self.model.extent();
             self.step_accumulator = 0.0;
             self.last_frame_time = ui.input(|input| input.time);
@@ -227,6 +236,7 @@ impl TilerApp {
             if ui.button("Reset mode").clicked() {
                 self.model.reset_active();
                 self.paint_stroke = None;
+                self.edge_copy_source = None;
                 *dimensions = DEFAULT_EXTENT;
                 self.notice = Some(format!("Reset {} mode", mode.label()));
             }
@@ -342,9 +352,30 @@ impl TilerApp {
             GridMode::Square => "Select a tile to edit its pixels; border pixels drive matching.",
             GridMode::Hex => "Edit name, color, and edge sockets. Orientations derive below.",
         });
+        let orphan_edges = self.model.square_orphan_edges();
+        if self.model.mode() == GridMode::Square {
+            let count = orphan_edges
+                .iter()
+                .map(|(_, edges)| edges.iter().filter(|orphan| **orphan).count())
+                .sum::<usize>();
+            if count == 0 {
+                ui.colored_label(
+                    Color32::from_rgb(100, 220, 130),
+                    "All tile edges have partners",
+                );
+            } else {
+                ui.colored_label(
+                    Color32::from_rgb(255, 105, 105),
+                    format!("{count} orphan edge(s) need a matching partner"),
+                );
+            }
+        }
         let labels = direction_labels(self.model.mode());
         let mut pending_delete: Option<(TileId, String)> = None;
         for (tile_id, style) in self.model.tiles() {
+            let tile_orphans = orphan_edges
+                .iter()
+                .find_map(|(candidate, edges)| (*candidate == tile_id).then_some(*edges));
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 if self.model.mode() == GridMode::Square {
@@ -368,6 +399,15 @@ impl TilerApp {
                 if ui.button("Delete").clicked() {
                     pending_delete = Some((tile_id, style.name.clone()));
                 }
+                if let Some(edges) = tile_orphans {
+                    let count = edges.iter().filter(|orphan| **orphan).count();
+                    if count > 0 {
+                        ui.colored_label(
+                            Color32::from_rgb(255, 105, 105),
+                            format!("{count} orphan"),
+                        );
+                    }
+                }
             });
             if self.model.mode() == GridMode::Hex {
                 ui.horizontal_wrapped(|ui| {
@@ -384,6 +424,7 @@ impl TilerApp {
         if let Some((tile_id, name)) = pending_delete {
             self.model.remove_tile(tile_id);
             self.paint_stroke = None;
+            self.edge_copy_source = None;
             self.notice = Some(format!("Deleted {name}"));
         }
         ui.add_space(4.0);
@@ -412,6 +453,15 @@ impl TilerApp {
         });
         ui.add(egui::Slider::new(&mut self.brush_size, 1..=MAX_BRUSH_SIZE).text("Brush pixels"));
         ui.weak("Left-drag paints · Right-drag erases to the closed-edge background");
+        ui.weak("Linked border painting is active; matching and reversed edges update together.");
+
+        let orphan_edges = self
+            .model
+            .square_orphan_edges()
+            .into_iter()
+            .find_map(|(candidate, edges)| (candidate == tile_id).then_some(edges))
+            .unwrap_or([false; 4]);
+        self.show_edge_assistant(ui, orphan_edges);
 
         let editor_size = Vec2::splat(RASTER_SIZE as f32 * EDITOR_PIXEL_SIZE);
         let (response, painter) = ui.allocate_painter(editor_size, Sense::drag());
@@ -468,10 +518,105 @@ impl TilerApp {
 
         if let Some(raster) = self.model.selected_raster() {
             paint_raster_editor(&painter, response.rect, raster);
+            paint_orphan_edges(&painter, response.rect, orphan_edges);
         }
         if let Some(pixel) = hovered_pixel {
             paint_brush_preview(&painter, response.rect, pixel, self.brush_size);
         }
+    }
+
+    fn show_edge_assistant(&mut self, ui: &mut egui::Ui, orphan_edges: [bool; 4]) {
+        ui.add_space(4.0);
+        ui.label(RichText::new("Edge assistant").strong());
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Selected edge status:");
+            for direction in SquareDirection::ALL.iter().copied() {
+                let orphan = orphan_edges[direction.index()];
+                ui.colored_label(
+                    if orphan {
+                        Color32::from_rgb(255, 105, 105)
+                    } else {
+                        Color32::from_rgb(100, 220, 130)
+                    },
+                    format!(
+                        "{} {}",
+                        square_direction_label(direction),
+                        if orphan { "orphan" } else { "linked" }
+                    ),
+                );
+            }
+        });
+
+        let tiles = self.model.tiles();
+        if self
+            .edge_copy_source
+            .is_some_and(|source| !tiles.iter().any(|(tile, _)| *tile == source.tile))
+        {
+            self.edge_copy_source = None;
+        }
+        let selected_source = self
+            .edge_copy_source
+            .and_then(|source| {
+                tiles
+                    .iter()
+                    .find(|(tile, _)| *tile == source.tile)
+                    .map(|(_, style)| edge_source_label(&style.name, source.direction))
+            })
+            .unwrap_or_else(|| "Choose an edge".to_owned());
+
+        ui.horizontal(|ui| {
+            ui.label("Source");
+            egui::ComboBox::from_id_salt("edge-copy-source")
+                .selected_text(selected_source)
+                .show_ui(ui, |ui| {
+                    for (tile, style) in &tiles {
+                        for direction in SquareDirection::ALL.iter().copied() {
+                            let source = SquareEdgeRef {
+                                tile: *tile,
+                                direction,
+                            };
+                            ui.selectable_value(
+                                &mut self.edge_copy_source,
+                                Some(source),
+                                edge_source_label(&style.name, direction),
+                            );
+                        }
+                    }
+                });
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Target");
+            for direction in SquareDirection::ALL.iter().copied() {
+                ui.selectable_value(
+                    &mut self.edge_copy_target,
+                    direction,
+                    square_direction_label(direction),
+                );
+            }
+            ui.checkbox(&mut self.reverse_edge_copy, "Reverse");
+            let copy = ui.add_enabled(self.edge_copy_source.is_some(), egui::Button::new("Copy"));
+            if copy.clicked() {
+                let result = self.model.copy_selected_edge(
+                    self.edge_copy_source
+                        .expect("copy button requires a source edge"),
+                    self.edge_copy_target,
+                    self.reverse_edge_copy,
+                );
+                self.notice = Some(match result {
+                    EdgeCopyResult::Applied => {
+                        "Copied edge and updated its linked family".to_owned()
+                    }
+                    EdgeCopyResult::NoChange => "Target edge already matches the source".to_owned(),
+                    EdgeCopyResult::Conflict => {
+                        "Copy would assign conflicting linked corner colors".to_owned()
+                    }
+                    EdgeCopyResult::Invalid => "Choose a valid source and target edge".to_owned(),
+                });
+                if result == EdgeCopyResult::Applied {
+                    ui.ctx().request_repaint();
+                }
+            }
+        });
     }
 
     fn show_variant_palette(&mut self, ui: &mut egui::Ui) {
@@ -907,6 +1052,35 @@ fn paint_raster_editor(painter: &egui::Painter, canvas: Rect, raster: &Raster) {
     );
 }
 
+fn paint_orphan_edges(painter: &egui::Painter, canvas: Rect, orphan_edges: [bool; 4]) {
+    let stroke = Stroke::new(4.0, Color32::from_rgb(255, 75, 75));
+    let inset = 2.0;
+    for direction in SquareDirection::ALL.iter().copied() {
+        if !orphan_edges[direction.index()] {
+            continue;
+        }
+        let points = match direction {
+            SquareDirection::North => [
+                canvas.left_top() + Vec2::new(0.0, inset),
+                canvas.right_top() + Vec2::new(0.0, inset),
+            ],
+            SquareDirection::East => [
+                canvas.right_top() + Vec2::new(-inset, 0.0),
+                canvas.right_bottom() + Vec2::new(-inset, 0.0),
+            ],
+            SquareDirection::South => [
+                canvas.left_bottom() + Vec2::new(0.0, -inset),
+                canvas.right_bottom() + Vec2::new(0.0, -inset),
+            ],
+            SquareDirection::West => [
+                canvas.left_top() + Vec2::new(inset, 0.0),
+                canvas.left_bottom() + Vec2::new(inset, 0.0),
+            ],
+        };
+        painter.line_segment(points, stroke);
+    }
+}
+
 fn paint_brush_preview(painter: &egui::Painter, canvas: Rect, center: Coord2, brush_size: usize) {
     let size = brush_size as i32;
     let offset = (size - 1) / 2;
@@ -975,6 +1149,19 @@ fn direction_labels(mode: GridMode) -> &'static [&'static str] {
         GridMode::Square => &["N", "E", "S", "W"],
         GridMode::Hex => &["NE", "E", "SE", "SW", "W", "NW"],
     }
+}
+
+fn square_direction_label(direction: SquareDirection) -> &'static str {
+    match direction {
+        SquareDirection::North => "N",
+        SquareDirection::East => "E",
+        SquareDirection::South => "S",
+        SquareDirection::West => "W",
+    }
+}
+
+fn edge_source_label(name: &str, direction: SquareDirection) -> String {
+    format!("{name} · {}", square_direction_label(direction))
 }
 
 fn style_color(color: [u8; 3]) -> Color32 {

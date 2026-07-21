@@ -28,11 +28,23 @@ impl Raster {
         self.pixels[Coord2::new(x as i32, y as i32)] = color;
     }
 
+    pub(crate) fn set_pixel(&mut self, coord: Coord2, color: Rgba) -> bool {
+        let Some(pixel) = self.pixels.get_mut(coord) else {
+            return false;
+        };
+        if *pixel == color {
+            return false;
+        }
+        *pixel = color;
+        true
+    }
+
     /// Paints a continuous line of square brush impressions.
     ///
     /// Brush impressions are clipped to the raster. Even-sized brushes are
     /// biased toward positive coordinates so the pointer's pixel remains the
     /// upper-left member of the central pair.
+    #[cfg(test)]
     pub(crate) fn paint_stroke(
         &mut self,
         from: Coord2,
@@ -40,16 +52,28 @@ impl Raster {
         brush_size: usize,
         color: Rgba,
     ) -> bool {
+        let mut changed = false;
+        for coord in self.stroke_pixels(from, to, brush_size) {
+            changed |= self.set_pixel(coord, color);
+        }
+        changed
+    }
+
+    /// Returns every pixel covered by a continuous clipped brush stroke.
+    ///
+    /// Pixels appear at most once, in row-major order, so callers can expand
+    /// the stroke through constraints before applying it atomically.
+    pub(crate) fn stroke_pixels(&self, from: Coord2, to: Coord2, brush_size: usize) -> Vec<Coord2> {
         let extent = Extent2::new(RASTER_SIZE, RASTER_SIZE);
         if brush_size == 0
             || brush_size > RASTER_SIZE
             || !extent.contains(from)
             || !extent.contains(to)
         {
-            return false;
+            return Vec::new();
         }
 
-        let mut changed = false;
+        let mut covered = vec![false; RASTER_SIZE * RASTER_SIZE];
         let mut x = from.x;
         let mut y = from.y;
         let dx = (to.x - from.x).abs();
@@ -59,7 +83,7 @@ impl Raster {
         let mut error = dx + dy;
 
         loop {
-            changed |= self.paint_brush(Coord2::new(x, y), brush_size, color);
+            Self::mark_brush(&mut covered, Coord2::new(x, y), brush_size);
             if x == to.x && y == to.y {
                 break;
             }
@@ -73,27 +97,29 @@ impl Raster {
                 y += step_y;
             }
         }
-        changed
+        covered
+            .into_iter()
+            .enumerate()
+            .filter(|(_, covered)| *covered)
+            .map(|(index, _)| extent.coordinate(index).unwrap())
+            .collect()
     }
 
-    fn paint_brush(&mut self, center: Coord2, brush_size: usize, color: Rgba) -> bool {
+    fn mark_brush(covered: &mut [bool], center: Coord2, brush_size: usize) {
         let Ok(size) = i32::try_from(brush_size) else {
-            return false;
+            return;
         };
         let offset = (size - 1) / 2;
-        let mut changed = false;
         for y in center.y - offset..center.y - offset + size {
             for x in center.x - offset..center.x - offset + size {
-                let Some(pixel) = self.pixels.get_mut(Coord2::new(x, y)) else {
+                let Some(index) =
+                    Extent2::new(RASTER_SIZE, RASTER_SIZE).linear_index(Coord2::new(x, y))
+                else {
                     continue;
                 };
-                if *pixel != color {
-                    *pixel = color;
-                    changed = true;
-                }
+                covered[index] = true;
             }
         }
-        changed
     }
 
     pub(crate) fn bytes(&self) -> Vec<u8> {
