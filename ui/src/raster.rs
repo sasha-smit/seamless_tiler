@@ -1,5 +1,5 @@
 use seamless_tiler::{
-    Coord2, D4, D6, EdgeStrip, Extent2, Grid, HexDirection, SocketMap, SquareDirection,
+    Coord2, D4, D6, Direction, EdgeStrip, Extent2, Grid, HexDirection, SocketMap, SquareDirection,
 };
 
 pub(crate) const SQUARE_RASTER_SIZE: usize = 32;
@@ -198,13 +198,11 @@ impl SquareRaster {
 ///
 /// The rectangular backing grid contains transparent padding. Only coordinates
 /// inside the six integer half-planes are authoritative raster samples.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct HexRaster {
     pixels: Grid<Rgba>,
 }
 
-#[allow(dead_code)]
 impl HexRaster {
     pub(crate) fn filled(color: Rgba) -> Self {
         let extent = Extent2::new(HEX_STORAGE_SIZE, HEX_STORAGE_SIZE);
@@ -338,7 +336,7 @@ impl HexRaster {
 /// Builds the temporary procedural picture used until the pencil editor lands.
 /// The outer border uses catalog-wide colors so strips can match across tiles
 /// whose interior tints differ.
-pub(crate) fn generate_raster(edge_mask: &[bool; 4], color: [u8; 3]) -> SquareRaster {
+pub(crate) fn generate_square_raster(edge_mask: &[bool; 4], color: [u8; 3]) -> SquareRaster {
     let dim = |channel: u8| (channel as f32 * 0.30) as u8;
     let interior = [dim(color[0]), dim(color[1]), dim(color[2]), 255];
     let mut raster = SquareRaster::filled(EDGE_BACKGROUND);
@@ -385,13 +383,77 @@ pub(crate) fn generate_raster(edge_mask: &[bool; 4], color: [u8; 3]) -> SquareRa
     raster
 }
 
+/// Builds the temporary procedural hex picture used until the pencil editor
+/// lands. Arms are generated on the axial lattice so rotations and reflections
+/// remain exact sample permutations.
+pub(crate) fn generate_hex_raster(edge_mask: &[bool; 6], color: [u8; 3]) -> HexRaster {
+    const ARM_RADIUS: i32 = 3;
+
+    let dim = |channel: u8| (channel as f32 * 0.30) as u8;
+    let interior = [dim(color[0]), dim(color[1]), dim(color[2]), 255];
+    let mut raster = HexRaster::filled(interior);
+
+    for direction in HexDirection::ALL.iter().copied() {
+        for coord in HexRaster::edge_coordinates(direction) {
+            raster.set_pixel(coord, EDGE_BACKGROUND);
+        }
+    }
+
+    let arm_reach = (3 * HEX_EDGE_INTERVALS) / 2;
+    let rotations: [D6; 6] = std::array::from_fn(|index| {
+        let direction = HexDirection::ALL[index];
+        D6::ALL
+            .into_iter()
+            .find(|transform| {
+                !transform.is_reflected()
+                    && transform.apply_direction(HexDirection::NorthEast) == direction
+            })
+            .expect("every hex direction has a pure rotation")
+    });
+    let coordinates: Vec<_> = raster.coordinates().collect();
+    for coord in coordinates {
+        let in_hub = hex_distance(coord, Coord2::ZERO) <= ARM_RADIUS;
+        let in_arm = edge_mask
+            .iter()
+            .copied()
+            .enumerate()
+            .any(|(index, active)| {
+                active
+                    && (0..=arm_reach).any(|step| {
+                        let canonical = Coord2::new(step, -step);
+                        let center = rotations[index]
+                            .checked_apply(canonical)
+                            .expect("fixed hex arm coordinates cannot overflow");
+                        hex_distance(coord, center) <= ARM_RADIUS
+                    })
+            });
+        if in_hub || in_arm {
+            raster.set_pixel(coord, DEFAULT_PAINT_COLOR);
+        }
+    }
+
+    raster
+}
+
+fn hex_distance(left: Coord2, right: Coord2) -> i32 {
+    let dq = (left.x - right.x).abs();
+    let dr = (left.y - right.y).abs();
+    let ds = ((left.x + left.y) - (right.x + right.y)).abs();
+    dq.max(dr).max(ds)
+}
+
 #[cfg(test)]
 pub(crate) fn closed_edge() -> EdgeStrip<Rgba> {
     EdgeStrip::new(vec![EDGE_BACKGROUND; SQUARE_RASTER_SIZE])
 }
 
+#[cfg(test)]
+pub(crate) fn closed_hex_edge() -> EdgeStrip<Rgba> {
+    EdgeStrip::new(vec![EDGE_BACKGROUND; HEX_EDGE_SAMPLES])
+}
+
 pub(crate) fn is_closed_edge(edge: &EdgeStrip<Rgba>) -> bool {
-    edge.len() == SQUARE_RASTER_SIZE && edge.iter().all(|pixel| *pixel == EDGE_BACKGROUND)
+    !edge.is_empty() && edge.iter().all(|pixel| *pixel == EDGE_BACKGROUND)
 }
 
 #[cfg(test)]
@@ -602,16 +664,16 @@ mod tests {
 
     #[test]
     fn generated_edges_are_catalog_independent_and_closed_when_inactive() {
-        let blank_a = generate_raster(&[false; 4], [255, 0, 0]);
-        let blank_b = generate_raster(&[false; 4], [0, 255, 0]);
+        let blank_a = generate_square_raster(&[false; 4], [255, 0, 0]);
+        let blank_b = generate_square_raster(&[false; 4], [0, 255, 0]);
         assert_ne!(blank_a, blank_b);
         for direction in SquareDirection::ALL.iter().copied() {
             assert_eq!(blank_a.edge(direction), closed_edge());
             assert_eq!(blank_a.edge(direction), blank_b.edge(direction));
         }
 
-        let north_a = generate_raster(&[true, false, false, false], [255, 0, 0]);
-        let north_b = generate_raster(&[true, false, false, false], [0, 255, 0]);
+        let north_a = generate_square_raster(&[true, false, false, false], [255, 0, 0]);
+        let north_b = generate_square_raster(&[true, false, false, false], [0, 255, 0]);
         assert_eq!(
             north_a.edge(SquareDirection::North),
             north_b.edge(SquareDirection::North)
@@ -621,7 +683,7 @@ mod tests {
 
     #[test]
     fn transform_round_trips_every_generated_raster() {
-        let raster = generate_raster(&[true, true, false, false], [80, 120, 160]);
+        let raster = generate_square_raster(&[true, true, false, false], [80, 120, 160]);
         for transform in D4::ALL {
             assert_eq!(
                 raster
@@ -629,6 +691,54 @@ mod tests {
                     .transformed(transform.inverse()),
                 raster
             );
+        }
+    }
+
+    #[test]
+    fn generated_hex_edges_are_shared_and_closed_when_inactive() {
+        let blank = generate_hex_raster(&[false; 6], [255, 0, 0]);
+        for direction in HexDirection::ALL.iter().copied() {
+            assert_eq!(blank.edge(direction), closed_hex_edge());
+        }
+
+        let mut active_profile = None;
+        for direction in HexDirection::ALL.iter().copied() {
+            let mut mask = [false; 6];
+            mask[direction.index()] = true;
+            let red = generate_hex_raster(&mask, [255, 0, 0]);
+            let green = generate_hex_raster(&mask, [0, 255, 0]);
+            assert_eq!(red.edge(direction), green.edge(direction));
+            assert_ne!(red.edge(direction), closed_hex_edge());
+            if let Some(profile) = &active_profile {
+                assert_eq!(&red.edge(direction), profile);
+            } else {
+                active_profile = Some(red.edge(direction));
+            }
+            for inactive in HexDirection::ALL.iter().copied() {
+                if inactive != direction {
+                    assert_eq!(red.edge(inactive), closed_hex_edge());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn generated_hex_rasters_are_d6_equivariant() {
+        for bits in 0_u8..64 {
+            let mask = std::array::from_fn(|index| bits & (1 << index) != 0);
+            let raster = generate_hex_raster(&mask, [80, 120, 160]);
+            for transform in D6::ALL {
+                let mut transformed_mask = [false; 6];
+                for direction in HexDirection::ALL.iter().copied() {
+                    transformed_mask[transform.apply_direction(direction).index()] =
+                        mask[direction.index()];
+                }
+                assert_eq!(
+                    raster.transformed(transform),
+                    generate_hex_raster(&transformed_mask, [80, 120, 160]),
+                    "mask {bits:06b}, transform {transform:?}",
+                );
+            }
         }
     }
 

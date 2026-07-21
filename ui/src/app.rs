@@ -47,12 +47,11 @@ struct PaintStroke {
 }
 
 /// Per-variant textures for the active catalog, rebuilt when the mode or
-/// catalog version changes. Hex entries remain empty until hex rasters become
-/// authoritative.
+/// catalog version changes.
 struct VariantTextureCache {
     mode: GridMode,
     version: u64,
-    textures: Vec<Option<TextureHandle>>,
+    textures: Vec<TextureHandle>,
 }
 
 impl Default for TilerApp {
@@ -148,19 +147,21 @@ impl TilerApp {
         });
     }
 
-    fn build_variant_texture(&self, ctx: &egui::Context, index: usize) -> Option<TextureHandle> {
-        let variant = self.model.variant_image(index)?;
+    fn build_variant_texture(&self, ctx: &egui::Context, index: usize) -> TextureHandle {
+        let variant = self
+            .model
+            .variant_image(index)
+            .expect("catalog variants have raster images");
         let image = ColorImage::from_rgba_unmultiplied(variant.size(), variant.rgba());
-        Some(ctx.load_texture(format!("variant-{index}"), image, TextureOptions::NEAREST))
+        ctx.load_texture(format!("variant-{index}"), image, TextureOptions::NEAREST)
     }
 
-    /// The cached texture for a variant in the active square catalog, if any.
+    /// The cached texture for a variant in the active catalog, if any.
     fn variant_texture(&self, index: usize) -> Option<&TextureHandle> {
         self.texture_cache
             .as_ref()
             .filter(|cache| cache.mode == self.model.mode())
             .and_then(|cache| cache.textures.get(index))
-            .and_then(Option::as_ref)
     }
 
     /// Draws a variant's raster into `rect`, returning whether a texture existed.
@@ -254,7 +255,7 @@ impl TilerApp {
         }
         ui.weak(match self.model.mode() {
             GridMode::Square => "Bounded edges require background-only pixel strips.",
-            GridMode::Hex => "Bounded edges close outward-facing path sockets.",
+            GridMode::Hex => "Bounded edges require background-only pixel strips.",
         });
     }
 
@@ -347,7 +348,7 @@ impl TilerApp {
         ui.heading("Tile catalog");
         ui.weak(match self.model.mode() {
             GridMode::Square => "Select a tile to edit its pixels; border pixels drive matching.",
-            GridMode::Hex => "Edit name, color, and edge sockets. Orientations derive below.",
+            GridMode::Hex => "Edge checkboxes regenerate the raster; border pixels drive matching.",
         });
         let orphan_edges = self.model.square_orphan_edges();
         if self.model.mode() == GridMode::Square {
@@ -711,17 +712,11 @@ impl TilerApp {
             ),
         );
         if enabled {
-            let drew_raster = self.model.mode() == GridMode::Square
-                && self.paint_variant_texture(ui.painter(), rect.shrink(4.0), variant_index);
-            if !drew_raster {
-                paint_sockets(
-                    ui.painter(),
-                    rect.center(),
-                    21.0,
-                    self.model.mode(),
-                    &self.model.variant_sockets(variant_index),
-                );
-            }
+            self.paint_variant_texture(
+                ui.painter(),
+                preview_texture_rect(self.model.mode(), rect, 4.0),
+                variant_index,
+            );
         } else {
             ui.painter().line_segment(
                 [rect.left_top(), rect.right_bottom()],
@@ -801,10 +796,12 @@ impl TilerApp {
                     style.name,
                     orientation_label(view.orientation)
                 ));
-                if self.model.mode() == GridMode::Square {
-                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(44.0), Sense::hover());
-                    self.paint_variant_texture(ui.painter(), rect, variant);
-                }
+                let (rect, _) = ui.allocate_exact_size(Vec2::splat(44.0), Sense::hover());
+                self.paint_variant_texture(
+                    ui.painter(),
+                    preview_texture_rect(self.model.mode(), rect, 0.0),
+                    variant,
+                );
             }
             CellVisual::Superposition {
                 candidates,
@@ -931,17 +928,20 @@ impl TilerApp {
                     );
                 }
                 CellVisual::Collapsed { variant, pinned } => {
-                    let drew_raster = mode == GridMode::Square && {
-                        let rect = square_rect(canvas, coord, self.cell_size);
-                        self.paint_variant_texture(painter, rect, variant)
-                    };
-                    if !drew_raster {
-                        paint_sockets(
+                    self.paint_variant_texture(
+                        painter,
+                        cell_texture_rect(mode, canvas, coord, self.cell_size),
+                        variant,
+                    );
+                    if mode == GridMode::Hex {
+                        paint_cell_outline(
                             painter,
-                            center,
-                            self.cell_size * 0.5,
                             mode,
-                            &self.model.variant_sockets(variant),
+                            canvas,
+                            coord,
+                            self.cell_size,
+                            0.0,
+                            Stroke::new(1.0, Color32::from_gray(82)),
                         );
                     }
                     if pinned {
@@ -1287,6 +1287,26 @@ fn square_rect(canvas: Rect, coord: Coord2, cell_size: f32) -> Rect {
     Rect::from_min_size(min, Vec2::splat(cell_size))
 }
 
+fn cell_texture_rect(mode: GridMode, canvas: Rect, coord: Coord2, cell_size: f32) -> Rect {
+    match mode {
+        GridMode::Square => square_rect(canvas, coord, cell_size),
+        GridMode::Hex => Rect::from_center_size(
+            cell_center(mode, canvas, coord, cell_size),
+            Vec2::new(hex_width(cell_size), cell_size),
+        ),
+    }
+}
+
+fn preview_texture_rect(mode: GridMode, rect: Rect, margin: f32) -> Rect {
+    let height = (rect.height() - 2.0 * margin).max(0.0);
+    match mode {
+        GridMode::Square => Rect::from_center_size(rect.center(), Vec2::splat(height)),
+        GridMode::Hex => {
+            Rect::from_center_size(rect.center(), Vec2::new(hex_width(height), height))
+        }
+    }
+}
+
 fn paint_preview_cell(
     painter: &egui::Painter,
     rect: Rect,
@@ -1359,40 +1379,6 @@ fn paint_cell_outline(
             ));
         }
     }
-}
-
-fn paint_sockets(
-    painter: &egui::Painter,
-    center: Pos2,
-    radius: f32,
-    mode: GridMode,
-    sockets: &[bool],
-) {
-    for (index, socket) in sockets.iter().copied().enumerate() {
-        if !socket {
-            continue;
-        }
-        let vector = match mode {
-            GridMode::Square => match index {
-                0 => Vec2::new(0.0, -1.0),
-                1 => Vec2::new(1.0, 0.0),
-                2 => Vec2::new(0.0, 1.0),
-                _ => Vec2::new(-1.0, 0.0),
-            },
-            GridMode::Hex => {
-                let angle = -PI / 3.0 + index as f32 * PI / 3.0;
-                Vec2::new(angle.cos(), angle.sin())
-            }
-        };
-        painter.line_segment(
-            [
-                center + vector * (radius * 0.24),
-                center + vector * (radius * 0.92),
-            ],
-            Stroke::new((radius * 0.2).clamp(3.0, 6.0), Color32::WHITE),
-        );
-    }
-    painter.circle_filled(center, radius * 0.18, Color32::WHITE);
 }
 
 #[cfg(test)]
@@ -1473,6 +1459,30 @@ mod tests {
     #[test]
     fn uncertainty_colors_distinguish_small_and_large_domains() {
         assert_ne!(uncertainty_color(2, 13), uncertainty_color(13, 13));
+    }
+
+    #[test]
+    fn hex_texture_rect_matches_the_pointy_top_cell_bounds() {
+        let canvas = Rect::from_min_size(Pos2::new(10.0, 20.0), Vec2::new(500.0, 500.0));
+        let coord = Coord2::new(2, 1);
+        let rect = cell_texture_rect(GridMode::Hex, canvas, coord, 64.0);
+        assert_eq!(
+            rect.center(),
+            cell_center(GridMode::Hex, canvas, coord, 64.0)
+        );
+        assert!((rect.width() - hex_width(64.0)).abs() < 0.0001);
+        assert!((rect.height() - 64.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn preview_texture_rect_preserves_each_mode_aspect_ratio() {
+        let rect = Rect::from_min_size(Pos2::new(4.0, 8.0), Vec2::splat(48.0));
+        let square = preview_texture_rect(GridMode::Square, rect, 4.0);
+        let hex = preview_texture_rect(GridMode::Hex, rect, 4.0);
+        assert_eq!(square.size(), Vec2::splat(40.0));
+        assert!((hex.height() - 40.0).abs() < f32::EPSILON);
+        assert!((hex.width() - hex_width(40.0)).abs() < f32::EPSILON);
+        assert_eq!(hex.center(), rect.center());
     }
 
     #[test]
