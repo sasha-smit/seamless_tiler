@@ -61,10 +61,12 @@ mod wfc;
 
 pub use grid::{Grid, GridError};
 pub use spatial::{Coord2, Extent2, Rect};
-pub use tile::{EqualityMatcher, OrientedTileId, SocketMap, SocketMatcher, Tile, TileId, TileSet};
+pub use tile::{
+    EdgeStrip, EqualityMatcher, OrientedTileId, SocketMap, SocketMatcher, Tile, TileId, TileSet,
+};
 pub use topology::{
     AxisBoundaries, Boundary, CellId, Direction, HexDirection, HexTopology, SquareDirection,
     SquareTopology, Topology, TopologyError,
 };
-pub use transform::{D4, D6, DirectionTransform, QuarterTurns, SixthTurns};
+pub use transform::{D4, D6, DirectionTransform, EdgeTransform, QuarterTurns, SixthTurns};
 pub use wfc::{PatternId, Wfc, WfcError, WfcRules, WfcStatus, WfcStep};

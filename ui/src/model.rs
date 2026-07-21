@@ -2,10 +2,15 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 
 use seamless_tiler::{
-    AxisBoundaries, CellId, Coord2, D4, D6, Direction, DirectionTransform, EqualityMatcher,
-    Extent2, Grid, HexDirection, HexTopology, OrientedTileId, SocketMap, SocketMatcher,
-    SquareDirection, SquareTopology, Tile, TileId, TileSet, Topology, Wfc, WfcRules, WfcStatus,
+    AxisBoundaries, CellId, Coord2, D4, D6, Direction, DirectionTransform, EdgeStrip,
+    EqualityMatcher, Extent2, Grid, HexDirection, HexTopology, OrientedTileId, SocketMap,
+    SocketMatcher, SquareDirection, SquareTopology, Tile, TileId, TileSet, Topology, Wfc, WfcRules,
+    WfcStatus,
 };
+
+#[cfg(test)]
+use crate::raster::closed_edge;
+use crate::raster::{Raster, Rgba, generate_raster, is_closed_edge};
 
 pub(crate) const DEFAULT_EXTENT: Extent2 = Extent2::new(12, 8);
 pub(crate) const MAX_DIMENSION: usize = 64;
@@ -41,6 +46,13 @@ pub(crate) struct TileStyle {
     pub(crate) color: [u8; 3],
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SquareTile {
+    style: TileStyle,
+    raster: Raster,
+    edge_mask: [bool; 4],
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Orientation {
     Square(D4),
@@ -73,11 +85,42 @@ trait ModeSpec: 'static {
     type Direction: Direction;
     type Transform: DirectionTransform<Self::Direction> + Copy + Eq + std::hash::Hash;
     type Topology: Topology<Coord = Coord2, Direction = Self::Direction> + Copy;
+    type Payload: Clone;
+    type Socket: Clone + PartialEq;
 
     fn topology(extent: Extent2, boundaries: AxisBoundaries) -> Self::Topology;
     fn transforms() -> &'static [Self::Transform];
     fn orientation(transform: Self::Transform) -> Orientation;
-    fn demo_tiles() -> TileSet<TileStyle, Self::Direction, bool>;
+    fn demo_tiles() -> TileSet<Self::Payload, Self::Direction, Self::Socket>;
+    fn new_tile(name: String) -> Tile<Self::Payload, Self::Direction, Self::Socket>;
+    fn style(payload: &Self::Payload) -> &TileStyle;
+    fn style_mut(payload: &mut Self::Payload) -> &mut TileStyle;
+    fn edge_controls(tile: &Tile<Self::Payload, Self::Direction, Self::Socket>) -> Vec<bool>;
+    fn set_edge(
+        tile: &mut Tile<Self::Payload, Self::Direction, Self::Socket>,
+        direction: Self::Direction,
+        value: bool,
+    ) -> bool;
+    fn set_color(
+        tile: &mut Tile<Self::Payload, Self::Direction, Self::Socket>,
+        color: [u8; 3],
+    ) -> bool;
+    fn oriented_socket(
+        tile: &Tile<Self::Payload, Self::Direction, Self::Socket>,
+        transform: Self::Transform,
+        world_direction: Self::Direction,
+    ) -> Self::Socket;
+    fn boundary_allows(socket: &Self::Socket) -> bool;
+    fn variants_equal(
+        tile: &Tile<Self::Payload, Self::Direction, Self::Socket>,
+        left: Self::Transform,
+        right: Self::Transform,
+    ) -> bool;
+    fn variant_raster(
+        tile: &Tile<Self::Payload, Self::Direction, Self::Socket>,
+        transform: Self::Transform,
+    ) -> Option<Raster>;
+    fn socket_active(socket: &Self::Socket) -> bool;
     fn default_seed() -> u64;
 }
 
@@ -87,6 +130,8 @@ impl ModeSpec for SquareMode {
     type Direction = SquareDirection;
     type Transform = D4;
     type Topology = SquareTopology;
+    type Payload = SquareTile;
+    type Socket = EdgeStrip<Rgba>;
 
     fn topology(extent: Extent2, boundaries: AxisBoundaries) -> Self::Topology {
         SquareTopology::new(extent, boundaries).expect("editor dimensions fit signed coordinates")
@@ -100,20 +145,93 @@ impl ModeSpec for SquareMode {
         Orientation::Square(transform)
     }
 
-    fn demo_tiles() -> TileSet<TileStyle, Self::Direction, bool> {
+    fn demo_tiles() -> TileSet<Self::Payload, Self::Direction, Self::Socket> {
         let mut tiles = TileSet::with_capacity(5);
-        insert_demo_tile(&mut tiles, "Blank", [72, 79, 89], |_| false);
-        insert_demo_tile(&mut tiles, "Straight", [55, 118, 171], |direction| {
+        insert_square_demo_tile(&mut tiles, "Blank", [72, 79, 89], |_| false);
+        insert_square_demo_tile(&mut tiles, "Straight", [55, 118, 171], |direction| {
             matches!(direction, SquareDirection::North | SquareDirection::South)
         });
-        insert_demo_tile(&mut tiles, "Corner", [46, 139, 87], |direction| {
+        insert_square_demo_tile(&mut tiles, "Corner", [46, 139, 87], |direction| {
             matches!(direction, SquareDirection::North | SquareDirection::East)
         });
-        insert_demo_tile(&mut tiles, "T junction", [157, 112, 40], |direction| {
+        insert_square_demo_tile(&mut tiles, "T junction", [157, 112, 40], |direction| {
             direction != SquareDirection::South
         });
-        insert_demo_tile(&mut tiles, "Cross", [135, 80, 156], |_| true);
+        insert_square_demo_tile(&mut tiles, "Cross", [135, 80, 156], |_| true);
         tiles
+    }
+
+    fn new_tile(name: String) -> Tile<Self::Payload, Self::Direction, Self::Socket> {
+        square_tile(name, NEW_TILE_COLOR, [false; 4])
+    }
+
+    fn style(payload: &Self::Payload) -> &TileStyle {
+        &payload.style
+    }
+
+    fn style_mut(payload: &mut Self::Payload) -> &mut TileStyle {
+        &mut payload.style
+    }
+
+    fn edge_controls(tile: &Tile<Self::Payload, Self::Direction, Self::Socket>) -> Vec<bool> {
+        tile.payload.edge_mask.to_vec()
+    }
+
+    fn set_edge(
+        tile: &mut Tile<Self::Payload, Self::Direction, Self::Socket>,
+        direction: Self::Direction,
+        value: bool,
+    ) -> bool {
+        let entry = &mut tile.payload.edge_mask[direction.index()];
+        if *entry == value {
+            return false;
+        }
+        *entry = value;
+        regenerate_square_tile(tile);
+        true
+    }
+
+    fn set_color(
+        tile: &mut Tile<Self::Payload, Self::Direction, Self::Socket>,
+        color: [u8; 3],
+    ) -> bool {
+        if tile.payload.style.color == color {
+            return false;
+        }
+        tile.payload.style.color = color;
+        regenerate_square_tile(tile);
+        true
+    }
+
+    fn oriented_socket(
+        tile: &Tile<Self::Payload, Self::Direction, Self::Socket>,
+        transform: Self::Transform,
+        world_direction: Self::Direction,
+    ) -> Self::Socket {
+        tile.oriented_edge(transform, world_direction)
+    }
+
+    fn boundary_allows(socket: &Self::Socket) -> bool {
+        is_closed_edge(socket)
+    }
+
+    fn variants_equal(
+        tile: &Tile<Self::Payload, Self::Direction, Self::Socket>,
+        left: Self::Transform,
+        right: Self::Transform,
+    ) -> bool {
+        tile.payload.raster.transformed(left) == tile.payload.raster.transformed(right)
+    }
+
+    fn variant_raster(
+        tile: &Tile<Self::Payload, Self::Direction, Self::Socket>,
+        transform: Self::Transform,
+    ) -> Option<Raster> {
+        Some(tile.payload.raster.transformed(transform))
+    }
+
+    fn socket_active(socket: &Self::Socket) -> bool {
+        !is_closed_edge(socket)
     }
 
     fn default_seed() -> u64 {
@@ -127,6 +245,8 @@ impl ModeSpec for HexMode {
     type Direction = HexDirection;
     type Transform = D6;
     type Topology = HexTopology;
+    type Payload = TileStyle;
+    type Socket = bool;
 
     fn topology(extent: Extent2, boundaries: AxisBoundaries) -> Self::Topology {
         HexTopology::new(extent, boundaries).expect("editor dimensions fit signed coordinates")
@@ -140,23 +260,103 @@ impl ModeSpec for HexMode {
         Orientation::Hex(transform)
     }
 
-    fn demo_tiles() -> TileSet<TileStyle, Self::Direction, bool> {
+    fn demo_tiles() -> TileSet<Self::Payload, Self::Direction, Self::Socket> {
         let mut tiles = TileSet::with_capacity(5);
-        insert_demo_tile(&mut tiles, "Blank", [72, 79, 89], |_| false);
-        insert_demo_tile(&mut tiles, "Straight", [55, 118, 171], |direction| {
+        insert_bool_demo_tile(&mut tiles, "Blank", [72, 79, 89], |_| false);
+        insert_bool_demo_tile(&mut tiles, "Straight", [55, 118, 171], |direction| {
             matches!(direction, HexDirection::NorthEast | HexDirection::SouthWest)
         });
-        insert_demo_tile(&mut tiles, "Bend", [46, 139, 87], |direction| {
+        insert_bool_demo_tile(&mut tiles, "Bend", [46, 139, 87], |direction| {
             matches!(direction, HexDirection::NorthEast | HexDirection::East)
         });
-        insert_demo_tile(&mut tiles, "Y junction", [157, 112, 40], |direction| {
+        insert_bool_demo_tile(&mut tiles, "Y junction", [157, 112, 40], |direction| {
             matches!(
                 direction,
                 HexDirection::NorthEast | HexDirection::SouthEast | HexDirection::West
             )
         });
-        insert_demo_tile(&mut tiles, "Hub", [135, 80, 156], |_| true);
+        insert_bool_demo_tile(&mut tiles, "Hub", [135, 80, 156], |_| true);
         tiles
+    }
+
+    fn new_tile(name: String) -> Tile<Self::Payload, Self::Direction, Self::Socket> {
+        Tile::new(
+            TileStyle {
+                name,
+                color: NEW_TILE_COLOR,
+            },
+            SocketMap::from_fn(|_| false),
+        )
+    }
+
+    fn style(payload: &Self::Payload) -> &TileStyle {
+        payload
+    }
+
+    fn style_mut(payload: &mut Self::Payload) -> &mut TileStyle {
+        payload
+    }
+
+    fn edge_controls(tile: &Tile<Self::Payload, Self::Direction, Self::Socket>) -> Vec<bool> {
+        tile.sockets.iter().map(|(_, socket)| *socket).collect()
+    }
+
+    fn set_edge(
+        tile: &mut Tile<Self::Payload, Self::Direction, Self::Socket>,
+        direction: Self::Direction,
+        value: bool,
+    ) -> bool {
+        let socket = &mut tile.sockets[direction];
+        if *socket == value {
+            return false;
+        }
+        *socket = value;
+        true
+    }
+
+    fn set_color(
+        tile: &mut Tile<Self::Payload, Self::Direction, Self::Socket>,
+        color: [u8; 3],
+    ) -> bool {
+        if tile.payload.color == color {
+            return false;
+        }
+        tile.payload.color = color;
+        true
+    }
+
+    fn oriented_socket(
+        tile: &Tile<Self::Payload, Self::Direction, Self::Socket>,
+        transform: Self::Transform,
+        world_direction: Self::Direction,
+    ) -> Self::Socket {
+        *tile.oriented_socket(transform, world_direction)
+    }
+
+    fn boundary_allows(socket: &Self::Socket) -> bool {
+        !socket
+    }
+
+    fn variants_equal(
+        tile: &Tile<Self::Payload, Self::Direction, Self::Socket>,
+        left: Self::Transform,
+        right: Self::Transform,
+    ) -> bool {
+        Self::Direction::ALL.iter().copied().all(|direction| {
+            Self::oriented_socket(tile, left, direction)
+                == Self::oriented_socket(tile, right, direction)
+        })
+    }
+
+    fn variant_raster(
+        _tile: &Tile<Self::Payload, Self::Direction, Self::Socket>,
+        _transform: Self::Transform,
+    ) -> Option<Raster> {
+        None
+    }
+
+    fn socket_active(socket: &Self::Socket) -> bool {
+        *socket
     }
 
     fn default_seed() -> u64 {
@@ -168,9 +368,10 @@ struct Session<M: ModeSpec> {
     pins: Grid<Option<usize>>,
     topology: M::Topology,
     boundaries: AxisBoundaries,
-    tiles: TileSet<TileStyle, M::Direction, bool>,
+    tiles: TileSet<M::Payload, M::Direction, M::Socket>,
     variants: Vec<OrientedTileId<M::Transform>>,
-    variant_sockets: Vec<Vec<bool>>,
+    variant_sockets: Vec<Vec<M::Socket>>,
+    variant_rasters: Vec<Option<Raster>>,
     enabled: Vec<bool>,
     pattern_variants: Vec<usize>,
     wave: Option<Wfc<M::Topology>>,
@@ -191,15 +392,16 @@ impl<M: ModeSpec> Session<M> {
             "editor extent must be between 1 and 64"
         );
         let tiles = M::demo_tiles();
-        let (variants, variant_sockets) = distinct_variants::<M>(&tiles);
+        let derived = distinct_variants::<M>(&tiles);
         let mut session = Self {
             pins: Grid::filled(extent, None).expect("editor dimensions have a valid area"),
             topology: M::topology(extent, AxisBoundaries::BOUNDED),
             boundaries: AxisBoundaries::BOUNDED,
-            enabled: vec![true; variants.len()],
+            enabled: vec![true; derived.variants.len()],
             tiles,
-            variants,
-            variant_sockets,
+            variants: derived.variants,
+            variant_sockets: derived.sockets,
+            variant_rasters: derived.rasters,
             pattern_variants: Vec::new(),
             wave: None,
             seed: M::default_seed(),
@@ -292,13 +494,7 @@ impl<M: ModeSpec> Session<M> {
 
     fn add_tile(&mut self) {
         let name = format!("Tile {}", self.tiles.len() + 1);
-        self.tiles.insert(Tile::new(
-            TileStyle {
-                name,
-                color: NEW_TILE_COLOR,
-            },
-            SocketMap::from_fn(|_| false),
-        ));
+        self.tiles.insert(M::new_tile(name));
         self.refresh_catalog(Some);
     }
 
@@ -326,13 +522,16 @@ impl<M: ModeSpec> Session<M> {
 
     fn set_tile_name(&mut self, tile: TileId, name: String) {
         if let Some(value) = self.tiles.get_mut(tile) {
-            value.payload.name = name;
+            M::style_mut(&mut value.payload).name = name;
         }
     }
 
     fn set_tile_color(&mut self, tile: TileId, color: [u8; 3]) {
-        if let Some(value) = self.tiles.get_mut(tile) {
-            value.payload.color = color;
+        let Some(value) = self.tiles.get_mut(tile) else {
+            return;
+        };
+        if M::set_color(value, color) {
+            self.refresh_variant_rasters();
             self.version = self.version.wrapping_add(1);
         }
     }
@@ -344,13 +543,9 @@ impl<M: ModeSpec> Session<M> {
         let Some(entry) = self.tiles.get_mut(tile) else {
             return;
         };
-        let Some(socket) = entry.sockets.get_mut(direction) else {
-            return;
-        };
-        if *socket == value {
+        if !M::set_edge(entry, direction, value) {
             return;
         }
-        *socket = value;
         self.refresh_catalog(Some);
     }
 
@@ -363,7 +558,8 @@ impl<M: ModeSpec> Session<M> {
         let old_variants = std::mem::take(&mut self.variants);
         let old_enabled = std::mem::take(&mut self.enabled);
 
-        let (variants, variant_sockets) = distinct_variants::<M>(&self.tiles);
+        let derived = distinct_variants::<M>(&self.tiles);
+        let variants = derived.variants;
 
         let new_index_of: HashMap<OrientedTileId<M::Transform>, usize> = variants
             .iter()
@@ -403,7 +599,8 @@ impl<M: ModeSpec> Session<M> {
         }
 
         self.variants = variants;
-        self.variant_sockets = variant_sockets;
+        self.variant_sockets = derived.sockets;
+        self.variant_rasters = derived.rasters;
         self.enabled = enabled;
         self.version = self.version.wrapping_add(1);
         self.rebuild_wave();
@@ -412,8 +609,24 @@ impl<M: ModeSpec> Session<M> {
     fn tile_sockets(&self, tile: TileId) -> Vec<bool> {
         self.tiles
             .get(tile)
-            .map(|value| value.sockets.iter().map(|(_, socket)| *socket).collect())
+            .map(M::edge_controls)
             .unwrap_or_default()
+    }
+
+    fn refresh_variant_rasters(&mut self) {
+        self.variant_rasters = self
+            .variants
+            .iter()
+            .map(|variant| {
+                self.tiles
+                    .get(variant.tile)
+                    .and_then(|tile| M::variant_raster(tile, variant.transform))
+            })
+            .collect();
+    }
+
+    fn variant_raster(&self, index: usize) -> Option<&Raster> {
+        self.variant_rasters.get(index).and_then(Option::as_ref)
     }
 
     fn variant_count(&self) -> usize {
@@ -599,33 +812,20 @@ impl<M: ModeSpec> Session<M> {
             let tile = self.variants[*variant_index].tile;
             1.0 / enabled_per_tile[tile.index()] as f64
         });
-        let rules = WfcRules::new(weights, |direction, source, neighbor| {
-            let source = self.variants[self.pattern_variants[source.index()]];
-            let neighbor = self.variants[self.pattern_variants[neighbor.index()]];
-            let source_tile = self
-                .tiles
-                .get(source.tile)
-                .expect("catalog variants refer to demo tiles");
-            let neighbor_tile = self
-                .tiles
-                .get(neighbor.tile)
-                .expect("catalog variants refer to demo tiles");
+        let rules = WfcRules::new(weights, |direction: M::Direction, source, neighbor| {
+            let source = self.pattern_variants[source.index()];
+            let neighbor = self.pattern_variants[neighbor.index()];
             EqualityMatcher.matches(
                 direction,
-                source_tile.oriented_socket(source.transform, direction),
-                neighbor_tile.oriented_socket(neighbor.transform, direction.opposite()),
+                &self.variant_sockets[source][direction.index()],
+                &self.variant_sockets[neighbor][direction.opposite().index()],
             )
         })
-        .expect("enabled demo patterns have valid weights");
+        .expect("enabled catalog patterns have valid weights");
 
         let topology = self.topology;
         let wave = Wfc::with_constraints(topology, rules, self.seed, |cell, pattern| {
             let variant_index = self.pattern_variants[pattern.index()];
-            let variant = self.variants[variant_index];
-            let tile = self
-                .tiles
-                .get(variant.tile)
-                .expect("catalog variants refer to demo tiles");
             let pin_matches = topology
                 .coordinate(cell)
                 .and_then(|coord| self.pins.get(coord))
@@ -633,38 +833,56 @@ impl<M: ModeSpec> Session<M> {
             pin_matches
                 && M::Direction::ALL.iter().copied().all(|direction| {
                     topology.neighbor(cell, direction).is_some()
-                        || !tile.oriented_socket(variant.transform, direction)
+                        || M::boundary_allows(
+                            &self.variant_sockets[variant_index][direction.index()],
+                        )
                 })
         });
         self.wave = Some(wave);
     }
 }
 
-fn distinct_variants<M: ModeSpec>(
-    tiles: &TileSet<TileStyle, M::Direction, bool>,
-) -> (Vec<OrientedTileId<M::Transform>>, Vec<Vec<bool>>) {
-    let mut variants = Vec::new();
-    let mut sockets = Vec::new();
-    for (tile_id, tile) in tiles.iter() {
-        let mut signatures = Vec::new();
-        for transform in M::transforms().iter().copied() {
-            let signature: Vec<_> = M::Direction::ALL
-                .iter()
-                .copied()
-                .map(|direction| *tile.oriented_socket(transform, direction))
-                .collect();
-            if signatures.contains(&signature) {
-                continue;
-            }
-            signatures.push(signature.clone());
-            variants.push(OrientedTileId::new(tile_id, transform));
-            sockets.push(signature);
-        }
-    }
-    (variants, sockets)
+struct DerivedVariants<M: ModeSpec> {
+    variants: Vec<OrientedTileId<M::Transform>>,
+    sockets: Vec<Vec<M::Socket>>,
+    rasters: Vec<Option<Raster>>,
 }
 
-fn insert_demo_tile<D: Direction>(
+fn distinct_variants<M: ModeSpec>(
+    tiles: &TileSet<M::Payload, M::Direction, M::Socket>,
+) -> DerivedVariants<M> {
+    let mut variants = Vec::new();
+    let mut sockets = Vec::new();
+    let mut rasters = Vec::new();
+    for (tile_id, tile) in tiles.iter() {
+        let mut representatives = Vec::new();
+        for transform in M::transforms().iter().copied() {
+            if representatives
+                .iter()
+                .copied()
+                .any(|representative| M::variants_equal(tile, representative, transform))
+            {
+                continue;
+            }
+            representatives.push(transform);
+            let signature = M::Direction::ALL
+                .iter()
+                .copied()
+                .map(|direction| M::oriented_socket(tile, transform, direction))
+                .collect();
+            variants.push(OrientedTileId::new(tile_id, transform));
+            sockets.push(signature);
+            rasters.push(M::variant_raster(tile, transform));
+        }
+    }
+    DerivedVariants {
+        variants,
+        sockets,
+        rasters,
+    }
+}
+
+fn insert_bool_demo_tile<D: Direction>(
     tiles: &mut TileSet<TileStyle, D, bool>,
     name: &str,
     color: [u8; 3],
@@ -679,13 +897,49 @@ fn insert_demo_tile<D: Direction>(
     ))
 }
 
+fn square_tile(
+    name: String,
+    color: [u8; 3],
+    edge_mask: [bool; 4],
+) -> Tile<SquareTile, SquareDirection, EdgeStrip<Rgba>> {
+    let raster = generate_raster(&edge_mask, color);
+    let sockets = raster.edges();
+    Tile::new(
+        SquareTile {
+            style: TileStyle { name, color },
+            raster,
+            edge_mask,
+        },
+        sockets,
+    )
+}
+
+fn regenerate_square_tile(tile: &mut Tile<SquareTile, SquareDirection, EdgeStrip<Rgba>>) {
+    tile.payload.raster = generate_raster(&tile.payload.edge_mask, tile.payload.style.color);
+    tile.sockets = tile.payload.raster.edges();
+}
+
+fn insert_square_demo_tile(
+    tiles: &mut TileSet<SquareTile, SquareDirection, EdgeStrip<Rgba>>,
+    name: &str,
+    color: [u8; 3],
+    mut socket: impl FnMut(SquareDirection) -> bool,
+) -> TileId {
+    let mut edge_mask = [false; 4];
+    for direction in SquareDirection::ALL.iter().copied() {
+        edge_mask[direction.index()] = socket(direction);
+    }
+    tiles.insert(square_tile(name.to_owned(), color, edge_mask))
+}
+
 trait SessionAccess {
     fn extent(&self) -> Extent2;
     fn boundaries(&self) -> AxisBoundaries;
     fn tiles(&self) -> Vec<(TileId, TileStyle)>;
     fn tile_style(&self, tile: TileId) -> Option<TileStyle>;
     fn variant(&self, index: usize) -> Option<VariantView>;
-    fn variant_sockets(&self, index: usize) -> &[bool];
+    fn variant_sockets(&self, index: usize) -> Vec<bool>;
+    fn variant_raster(&self, index: usize) -> Option<&Raster>;
     fn variant_enabled(&self, index: usize) -> bool;
     fn tile_sockets(&self, tile: TileId) -> Vec<bool>;
     fn variant_count(&self) -> usize;
@@ -736,11 +990,13 @@ impl<M: ModeSpec> SessionAccess for Session<M> {
     fn tiles(&self) -> Vec<(TileId, TileStyle)> {
         self.tiles
             .iter()
-            .map(|(tile, value)| (tile, value.payload.clone()))
+            .map(|(tile, value)| (tile, M::style(&value.payload).clone()))
             .collect()
     }
     fn tile_style(&self, tile: TileId) -> Option<TileStyle> {
-        self.tiles.get(tile).map(|value| value.payload.clone())
+        self.tiles
+            .get(tile)
+            .map(|value| M::style(&value.payload).clone())
     }
     fn variant(&self, index: usize) -> Option<VariantView> {
         let placement = *self.variants.get(index)?;
@@ -749,8 +1005,14 @@ impl<M: ModeSpec> SessionAccess for Session<M> {
             orientation: M::orientation(placement.transform),
         })
     }
-    fn variant_sockets(&self, index: usize) -> &[bool] {
-        self.variant_sockets.get(index).map_or(&[], Vec::as_slice)
+    fn variant_sockets(&self, index: usize) -> Vec<bool> {
+        self.variant_sockets
+            .get(index)
+            .map(|sockets| sockets.iter().map(M::socket_active).collect())
+            .unwrap_or_default()
+    }
+    fn variant_raster(&self, index: usize) -> Option<&Raster> {
+        self.variant_raster(index)
     }
     fn variant_enabled(&self, index: usize) -> bool {
         self.enabled.get(index).copied().unwrap_or(false)
@@ -938,8 +1200,11 @@ impl EditorModel {
     pub(crate) fn variant(&self, index: usize) -> Option<VariantView> {
         self.active().variant(index)
     }
-    pub(crate) fn variant_sockets(&self, index: usize) -> &[bool] {
+    pub(crate) fn variant_sockets(&self, index: usize) -> Vec<bool> {
         self.active().variant_sockets(index)
+    }
+    pub(crate) fn variant_raster(&self, index: usize) -> Option<&Raster> {
+        self.active().variant_raster(index)
     }
     pub(crate) fn variant_enabled(&self, index: usize) -> bool {
         self.active().variant_enabled(index)
@@ -1294,6 +1559,8 @@ mod tests {
         model.step();
         let observations = model.observations();
         let status = model.status();
+        let raster_before = model.variant_raster(0).cloned().unwrap();
+        let sockets_before = model.square.variant_sockets[0].clone();
 
         model.set_tile_name(TileId::new(0), "Empty".to_owned());
         model.set_tile_color(TileId::new(0), [1, 2, 3]);
@@ -1303,6 +1570,84 @@ mod tests {
         let style = model.tile_style(TileId::new(0)).unwrap();
         assert_eq!(style.name, "Empty");
         assert_eq!(style.color, [1, 2, 3]);
+        assert_ne!(model.variant_raster(0).unwrap(), &raster_before);
+        assert_eq!(model.square.variant_sockets[0], sockets_before);
+    }
+
+    #[test]
+    fn square_tile_sockets_are_always_extracted_from_the_owned_raster() {
+        let mut model = EditorModel::default();
+        for (_, tile) in model.square.tiles.iter() {
+            assert_eq!(tile.sockets, tile.payload.raster.edges());
+        }
+
+        model.set_tile_socket(TileId::new(0), SquareDirection::North.index(), true);
+        let tile = model.square.tiles.get(TileId::new(0)).unwrap();
+        assert_eq!(tile.sockets, tile.payload.raster.edges());
+        assert_ne!(tile.sockets[SquareDirection::North], closed_edge());
+    }
+
+    #[test]
+    fn square_variants_deduplicate_by_complete_oriented_raster() {
+        let mut tile = square_tile("Asymmetric".to_owned(), [80, 120, 160], [false; 4]);
+        tile.payload.raster.set(3, 7, [255, 0, 255, 255]);
+        tile.sockets = tile.payload.raster.edges();
+        let mut tiles = TileSet::new();
+        tiles.insert(tile);
+
+        let derived = distinct_variants::<SquareMode>(&tiles);
+        assert_eq!(derived.variants.len(), 8);
+        let distinct = derived
+            .rasters
+            .into_iter()
+            .flatten()
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(distinct.len(), 8);
+    }
+
+    fn assert_square_neighbors_have_equal_edges(session: &Session<SquareMode>) {
+        assert_eq!(session.status(), Some(WfcStatus::Solved));
+        for cell_index in 0..session.topology.cell_count() {
+            let cell = CellId::new(cell_index);
+            let coord = session.topology.coordinate(cell).unwrap();
+            let CellVisual::Collapsed {
+                variant: source, ..
+            } = session.cell_visual(coord)
+            else {
+                panic!("a solved cell must be collapsed");
+            };
+            for direction in SquareDirection::ALL.iter().copied() {
+                let source_edge = &session.variant_sockets[source][direction.index()];
+                if let Some(neighbor_cell) = session.topology.neighbor(cell, direction) {
+                    let neighbor_coord = session.topology.coordinate(neighbor_cell).unwrap();
+                    let CellVisual::Collapsed {
+                        variant: neighbor, ..
+                    } = session.cell_visual(neighbor_coord)
+                    else {
+                        panic!("a solved neighbor must be collapsed");
+                    };
+                    assert_eq!(
+                        source_edge,
+                        &session.variant_sockets[neighbor][direction.opposite().index()],
+                        "cell {coord:?} toward {direction:?}"
+                    );
+                } else {
+                    assert_eq!(source_edge, &closed_edge());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn solved_square_grids_are_pixel_continuous_at_bounded_and_wrapped_edges() {
+        let mut bounded = Session::<SquareMode>::new(Extent2::new(4, 3));
+        bounded.finish();
+        assert_square_neighbors_have_equal_edges(&bounded);
+
+        let mut wrapped = Session::<SquareMode>::new(Extent2::new(4, 3));
+        wrapped.set_boundaries(AxisBoundaries::TOROIDAL);
+        wrapped.finish();
+        assert_square_neighbors_have_equal_edges(&wrapped);
     }
 
     #[test]

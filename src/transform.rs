@@ -6,6 +6,15 @@ pub trait DirectionTransform<D>: Copy {
     fn inverse(self) -> Self;
 }
 
+/// Maps ordered edge samples through a reversible tile orientation.
+///
+/// Edge samples use a screen-space canonical order shared by opposite edges:
+/// top to bottom, or left to right for a horizontal edge. Implementations report
+/// whether transforming a local edge reverses that order in world space.
+pub trait EdgeTransform<D>: DirectionTransform<D> {
+    fn reverses_edge(self, local_direction: D) -> bool;
+}
+
 /// Clockwise quarter-turn rotations in screen coordinates (`x` right, `y` down).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
@@ -135,6 +144,21 @@ impl DirectionTransform<SquareDirection> for D4 {
 
     fn inverse(self) -> Self {
         D4::inverse(self)
+    }
+}
+
+impl EdgeTransform<SquareDirection> for D4 {
+    fn reverses_edge(self, local_direction: SquareDirection) -> bool {
+        let local_tangent = match local_direction {
+            SquareDirection::North | SquareDirection::South => Coord2::new(1, 0),
+            SquareDirection::East | SquareDirection::West => Coord2::new(0, 1),
+        };
+        let world_direction = self.apply_direction(local_direction);
+        let world_tangent = match world_direction {
+            SquareDirection::North | SquareDirection::South => Coord2::new(1, 0),
+            SquareDirection::East | SquareDirection::West => Coord2::new(0, 1),
+        };
+        self.checked_apply(local_tangent) == Some(Coord2::new(-world_tangent.x, -world_tangent.y))
     }
 }
 
@@ -279,6 +303,25 @@ impl DirectionTransform<HexDirection> for D6 {
     }
 }
 
+impl EdgeTransform<HexDirection> for D6 {
+    fn reverses_edge(self, local_direction: HexDirection) -> bool {
+        // Axial tangents whose screen projections follow the canonical order
+        // along each pair of parallel pointy-top hex edges.
+        let local_tangent = match local_direction {
+            HexDirection::NorthEast | HexDirection::SouthWest => Coord2::new(1, 1),
+            HexDirection::East | HexDirection::West => Coord2::new(-1, 2),
+            HexDirection::SouthEast | HexDirection::NorthWest => Coord2::new(-2, 1),
+        };
+        let world_direction = self.apply_direction(local_direction);
+        let world_tangent = match world_direction {
+            HexDirection::NorthEast | HexDirection::SouthWest => Coord2::new(1, 1),
+            HexDirection::East | HexDirection::West => Coord2::new(-1, 2),
+            HexDirection::SouthEast | HexDirection::NorthWest => Coord2::new(-2, 1),
+        };
+        self.checked_apply(local_tangent) == Some(Coord2::new(-world_tangent.x, -world_tangent.y))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,6 +386,42 @@ mod tests {
     }
 
     #[test]
+    fn d4_edge_reversal_obeys_inverse_and_composition_laws() {
+        for transform in D4::ALL {
+            for direction in SquareDirection::ALL.iter().copied() {
+                let world = transform.apply_direction(direction);
+                assert_eq!(
+                    transform.reverses_edge(direction),
+                    transform.inverse().reverses_edge(world)
+                );
+            }
+        }
+
+        for left in D4::ALL {
+            for right in D4::ALL {
+                for direction in SquareDirection::ALL.iter().copied() {
+                    assert_eq!(
+                        left.compose(right).reverses_edge(direction),
+                        right.reverses_edge(direction)
+                            ^ left.reverses_edge(right.apply_direction(direction))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn d4_edge_reversal_follows_screen_canonical_order() {
+        let clockwise = D4::new(QuarterTurns::One, false);
+        assert!(!clockwise.reverses_edge(SquareDirection::North));
+        assert!(clockwise.reverses_edge(SquareDirection::East));
+
+        let reflection = D4::new(QuarterTurns::Zero, true);
+        assert!(reflection.reverses_edge(SquareDirection::North));
+        assert!(!reflection.reverses_edge(SquareDirection::East));
+    }
+
+    #[test]
     fn checked_application_reports_overflow() {
         let reflection = D4::new(QuarterTurns::Zero, true);
         assert_eq!(reflection.checked_apply(Coord2::new(i32::MIN, 0)), None);
@@ -401,6 +480,43 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn d6_edge_reversal_obeys_inverse_and_composition_laws() {
+        for transform in D6::ALL {
+            for direction in HexDirection::ALL.iter().copied() {
+                let world = transform.apply_direction(direction);
+                assert_eq!(
+                    transform.reverses_edge(direction),
+                    transform.inverse().reverses_edge(world)
+                );
+            }
+        }
+
+        for left in D6::ALL {
+            for right in D6::ALL {
+                for direction in HexDirection::ALL.iter().copied() {
+                    assert_eq!(
+                        left.compose(right).reverses_edge(direction),
+                        right.reverses_edge(direction)
+                            ^ left.reverses_edge(right.apply_direction(direction))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn d6_edge_reversal_follows_screen_canonical_order() {
+        let clockwise = D6::new(SixthTurns::One, false);
+        assert!(!clockwise.reverses_edge(HexDirection::NorthEast));
+        assert!(!clockwise.reverses_edge(HexDirection::East));
+        assert!(clockwise.reverses_edge(HexDirection::SouthEast));
+
+        let reflection = D6::new(SixthTurns::Zero, true);
+        assert!(!reflection.reverses_edge(HexDirection::NorthEast));
+        assert!(!reflection.reverses_edge(HexDirection::East));
     }
 
     #[test]
