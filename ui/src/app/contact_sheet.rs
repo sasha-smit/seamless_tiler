@@ -12,8 +12,8 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 
 use super::{
-    Color32, GridMode, Pos2, Rect, Vec2, canvas_size, cell_texture_rect, hex_points,
-    point_in_convex_polygon, preview_texture_rect, regular_hex_points, square_rect, style_color,
+    Color32, GridMode, Pos2, Rect, Vec2, canvas_size, cell_texture_rect, point_in_convex_polygon,
+    preview_texture_rect, regular_hex_points, style_color,
 };
 use crate::model::{CellVisual, EditorModel};
 use crate::raster::{Rgba, VariantImage};
@@ -123,8 +123,11 @@ fn rgba(color: Color32) -> Rgba {
     [color.r(), color.g(), color.b(), 255]
 }
 
-/// Renders a solved grid the way [`super::TilerApp::paint_grid`] does: a filled
-/// cell polygon, then the collapsed variant's image on top.
+/// Renders only the variant textures of a solved grid.
+///
+/// The live canvas paints cell chrome below each image. Omitting it here is
+/// deliberate: fallback fill or outline colors must not hide transparent gaps
+/// in the texture coverage this regression test is meant to detect.
 fn render_grid(model: &EditorModel, cell_size: f32) -> Sheet {
     let extent = model.extent();
     let size = canvas_size(model.mode(), extent, cell_size);
@@ -139,19 +142,6 @@ fn render_grid(model: &EditorModel, cell_size: f32) -> Sheet {
         let CellVisual::Collapsed { variant, .. } = visual else {
             continue;
         };
-        let view = model.variant(variant).expect("wave refers to a variant");
-        let fill = rgba(style_color(
-            model
-                .tile_style(view.tile)
-                .expect("variant refers to a tile")
-                .color,
-        ));
-        match model.mode() {
-            GridMode::Square => {
-                sheet.fill_rect(square_rect(canvas, coord, cell_size).shrink(1.0), fill)
-            }
-            GridMode::Hex => sheet.fill_polygon(&hex_points(canvas, coord, cell_size, 1.0), fill),
-        }
         sheet.draw_image(
             cell_texture_rect(model.mode(), canvas, coord, cell_size),
             model
@@ -229,7 +219,6 @@ fn solved_grids_render_without_uncovered_seams() {
         std::fs::create_dir_all(dir).expect("contact sheet directory is creatable");
     }
 
-    let cell_size = 48.0;
     for (mode, name) in [(GridMode::Square, "square"), (GridMode::Hex, "hex")] {
         for (boundaries, suffix) in [
             (AxisBoundaries::BOUNDED, "bounded"),
@@ -237,11 +226,16 @@ fn solved_grids_render_without_uncovered_seams() {
         ] {
             let model = solved(mode, boundaries, Extent2::new(6, 5))
                 .unwrap_or_else(|| panic!("{name} {suffix} demo catalog solves"));
-            let sheet = render_grid(&model, cell_size);
-
-            assert_no_interior_holes(&sheet, &format!("{name} {suffix} grid"));
-            if let Some(dir) = &dump {
-                sheet.write_ppm(&dir.join(format!("{name}-grid-{suffix}.ppm")));
+            for cell_size in [28.0, 80.0] {
+                let sheet = render_grid(&model, cell_size);
+                let size = cell_size as usize;
+                assert_no_interior_holes(
+                    &sheet,
+                    &format!("{name} {suffix} grid at cell size {size}"),
+                );
+                if let Some(dir) = &dump {
+                    sheet.write_ppm(&dir.join(format!("{name}-grid-{suffix}-{size}.ppm")));
+                }
             }
 
             let orientations = render_orientations(&model);

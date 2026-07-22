@@ -51,7 +51,9 @@ border after an edit, and boolean sockets no longer exist. The procedural
 generators in `raster.rs` only seed demo tiles; never reintroduce them as a
 parallel source of truth. Deduplicate orientations by the complete transformed
 raster, and derive variants per tile so a pencil stroke only re-derives the
-tiles it changed.
+tiles it changed. Keep authored samples opaque; alpha is reserved for transparent
+padding outside the exported hex mask because neighboring hex images overlap at
+their shared boundary texels.
 
 Hex samples are *points* on an axial lattice, not areas: the outermost ring lies
 on the cell boundary and each corner is one sample shared by two sides. A hex

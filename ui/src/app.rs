@@ -496,7 +496,14 @@ impl TilerApp {
         ui.label(RichText::new(style.name).strong());
         ui.horizontal(|ui| {
             ui.label("Paint");
-            ui.color_edit_button_srgba_unmultiplied(&mut self.paint_color);
+            let mut rgb = [
+                self.paint_color[0],
+                self.paint_color[1],
+                self.paint_color[2],
+            ];
+            if ui.color_edit_button_srgb(&mut rgb).changed() {
+                self.paint_color = [rgb[0], rgb[1], rgb[2], 255];
+            }
         });
         let (max_brush, brush_label) = match mode {
             GridMode::Square => (MAX_BRUSH_SIZE, "Brush pixels"),

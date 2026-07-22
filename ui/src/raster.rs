@@ -413,7 +413,7 @@ impl HexRaster {
         let Some(radius) = brush_size.checked_sub(1).and_then(|radius| {
             i32::try_from(radius)
                 .ok()
-                .filter(|radius| *radius < HEX_EDGE_INTERVALS)
+                .filter(|radius| *radius <= HEX_EDGE_INTERVALS)
         }) else {
             return Vec::new();
         };
@@ -848,6 +848,7 @@ mod tests {
         );
         assert_eq!(HexRaster::brush_samples(Coord2::ZERO, 0), Vec::new());
         assert_eq!(HexRaster::brush_samples(Coord2::ZERO, 3).len(), 19);
+        assert!(!HexRaster::brush_samples(Coord2::ZERO, HEX_EDGE_SAMPLES).is_empty());
 
         let corner = Coord2::new(HEX_EDGE_INTERVALS, -2 * HEX_EDGE_INTERVALS);
         let clipped = HexRaster::brush_samples(corner, 3);

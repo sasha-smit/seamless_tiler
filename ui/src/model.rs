@@ -943,6 +943,12 @@ impl<M: ModeSpec<Socket = EdgeStrip<Rgba>>> Session<M> {
         brush_size: usize,
         color: Rgba,
     ) -> bool {
+        // Neighboring hex images overlap by one boundary texel to place sample
+        // centers on the geometric cell edge. Translucent boundary samples
+        // would therefore be blended twice and produce visible seams. Reserve
+        // alpha for transparent texture padding and keep authored samples
+        // opaque in both editor modes.
+        let color = [color[0], color[1], color[2], 255];
         let Some(tile_id) = self.selected_tile else {
             return false;
         };
@@ -2359,6 +2365,29 @@ mod tests {
         let variant = model.variants_for_tile(TileId::new(0))[0];
         model.set_variant_enabled(variant, false);
         assert_eq!(model.catalog_version(), after_remove);
+    }
+
+    #[test]
+    fn authored_samples_are_normalized_to_opaque_colors() {
+        let mut model = EditorModel::default();
+        let square = Coord2::new(3, 7);
+        assert!(model.paint_selected_tile(square, square, 1, [7, 11, 13, 0]));
+        let square_raster = &model
+            .square
+            .tiles
+            .get(TileId::new(0))
+            .unwrap()
+            .payload
+            .raster;
+        assert_eq!(
+            square_raster.get(square.x as usize, square.y as usize),
+            [7, 11, 13, 255],
+        );
+
+        select_hex(&mut model);
+        assert!(model.paint_selected_tile(Coord2::ZERO, Coord2::ZERO, 1, [17, 19, 23, 1]));
+        let hex_raster = &model.hex.tiles.get(TileId::new(0)).unwrap().payload.raster;
+        assert_eq!(hex_raster.get(Coord2::ZERO), Some([17, 19, 23, 255]),);
     }
 
     #[test]
