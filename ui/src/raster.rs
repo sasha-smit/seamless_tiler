@@ -266,6 +266,15 @@ impl HexRaster {
     /// The rectangular texel dimensions of the exported hex image.
     pub(crate) const IMAGE_SIZE: [usize; 2] = [HEX_IMAGE_WIDTH, HEX_IMAGE_HEIGHT];
 
+    /// The texel distance between the outermost sample centers on each axis.
+    ///
+    /// Hex samples are *points*, not areas: the outermost ones sit exactly on
+    /// the cell's boundary and corners are shared with the adjoining side. The
+    /// exported image therefore spans one texel more than the cell it depicts,
+    /// and a renderer must draw it into bounds inflated by
+    /// `IMAGE_SIZE / SAMPLE_SPAN` so sample centers land on the true geometry.
+    pub(crate) const SAMPLE_SPAN: [usize; 2] = [HEX_IMAGE_WIDTH - 1, HEX_IMAGE_HEIGHT - 1];
+
     pub(crate) fn filled(color: Rgba) -> Self {
         let extent = Extent2::new(HEX_STORAGE_SIZE, HEX_STORAGE_SIZE);
         let pixels = Grid::from_fn(extent, |storage| {

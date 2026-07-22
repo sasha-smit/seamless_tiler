@@ -17,8 +17,12 @@ use crate::model::{
 };
 use crate::raster::{
     DEFAULT_PAINT_COLOR, EDGE_BACKGROUND, HexRaster, Rgba, SQUARE_RASTER_SIZE, SquareRaster,
+    VariantImage,
 };
 use crate::seams::{EdgeCopyResult, EdgeRef, OrphanEdges};
+
+#[cfg(test)]
+mod contact_sheet;
 
 const DEFAULT_CELL_SIZE: f32 = 52.0;
 const DEFAULT_STEPS_PER_SECOND: f32 = 8.0;
@@ -70,11 +74,16 @@ struct EditorTextureCache {
     texture: TextureHandle,
 }
 
-/// Per-variant textures for the active catalog, rebuilt when the mode or
+/// Per-variant textures for the active catalog, refreshed when the mode or
 /// catalog version changes.
+///
+/// Every pointer event of a stroke bumps the catalog version, but a stroke only
+/// changes one tile's orientations, so each texture records the image it was
+/// uploaded from and unchanged variants keep their existing handle.
 struct VariantTextureCache {
     mode: GridMode,
     version: u64,
+    images: Vec<VariantImage>,
     textures: Vec<TextureHandle>,
 }
 
@@ -169,23 +178,49 @@ impl TilerApp {
         {
             return;
         }
-        let textures = (0..self.model.variant_count())
-            .map(|index| self.build_variant_texture(ctx, index))
-            .collect();
+
+        // Only the previous cache of the same mode can be reused; switching modes
+        // replaces the whole catalog.
+        let mut reusable: Vec<Option<(VariantImage, TextureHandle)>> = self
+            .texture_cache
+            .take()
+            .filter(|cache| cache.mode == mode)
+            .map(|cache| {
+                cache
+                    .images
+                    .into_iter()
+                    .zip(cache.textures)
+                    .map(Some)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let count = self.model.variant_count();
+        let mut images = Vec::with_capacity(count);
+        let mut textures = Vec::with_capacity(count);
+        for index in 0..count {
+            let image = self
+                .model
+                .variant_image(index)
+                .expect("catalog variants have raster images")
+                .clone();
+            let cached = reusable
+                .get_mut(index)
+                .filter(|slot| slot.as_ref().is_some_and(|(cached, _)| *cached == image))
+                .and_then(Option::take);
+            let texture = match cached {
+                Some((_, texture)) => texture,
+                None => build_variant_texture(ctx, index, &image),
+            };
+            images.push(image);
+            textures.push(texture);
+        }
         self.texture_cache = Some(VariantTextureCache {
             mode,
             version,
+            images,
             textures,
         });
-    }
-
-    fn build_variant_texture(&self, ctx: &egui::Context, index: usize) -> TextureHandle {
-        let variant = self
-            .model
-            .variant_image(index)
-            .expect("catalog variants have raster images");
-        let image = ColorImage::from_rgba_unmultiplied(variant.size(), variant.rgba());
-        ctx.load_texture(format!("variant-{index}"), image, TextureOptions::NEAREST)
     }
 
     /// The cached texture for a variant in the active catalog, if any.
@@ -196,10 +231,10 @@ impl TilerApp {
             .and_then(|cache| cache.textures.get(index))
     }
 
-    /// Draws a variant's raster into `rect`, returning whether a texture existed.
-    fn paint_variant_texture(&self, painter: &egui::Painter, rect: Rect, index: usize) -> bool {
+    /// Draws a variant's raster into `rect`, if its texture is cached.
+    fn paint_variant_texture(&self, painter: &egui::Painter, rect: Rect, index: usize) {
         let Some(texture) = self.variant_texture(index) else {
-            return false;
+            return;
         };
         painter.image(
             texture.id(),
@@ -207,7 +242,6 @@ impl TilerApp {
             Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
             Color32::WHITE,
         );
-        true
     }
 
     fn show_controls(&mut self, ui: &mut egui::Ui) {
@@ -217,10 +251,15 @@ impl TilerApp {
         ui.separator();
         self.show_solver_controls(ui);
         ui.separator();
-        self.show_tile_catalog(ui);
+        // Edge families cost a pass over the whole catalog, so derive them once
+        // and share them between the catalog list and the editor overlay.
+        let orphan_edges = self.model.orphan_edges();
+        self.show_tile_catalog(ui, &orphan_edges);
         ui.separator();
-        self.show_tile_editor(ui);
+        self.show_tile_editor(ui, &orphan_edges);
         ui.separator();
+        // Catalog edits above may have added, removed, or repainted variants.
+        self.ensure_textures(ui.ctx());
         self.show_variant_palette(ui);
         ui.separator();
         self.show_inspector(ui);
@@ -373,10 +412,9 @@ impl TilerApp {
         ui.colored_label(color, text);
     }
 
-    fn show_tile_catalog(&mut self, ui: &mut egui::Ui) {
+    fn show_tile_catalog(&mut self, ui: &mut egui::Ui, orphan_edges: &[(TileId, OrphanEdges)]) {
         ui.heading("Tile catalog");
         ui.weak("Select a tile to edit its samples; border samples drive matching.");
-        let orphan_edges = self.model.orphan_edges();
         let count = orphan_edges
             .iter()
             .map(|(_, edges)| orphan_count(*edges))
@@ -443,7 +481,7 @@ impl TilerApp {
         }
     }
 
-    fn show_tile_editor(&mut self, ui: &mut egui::Ui) {
+    fn show_tile_editor(&mut self, ui: &mut egui::Ui, orphan_edges: &[(TileId, OrphanEdges)]) {
         ui.heading("Pencil editor");
         let Some(tile_id) = self.model.selected_tile() else {
             ui.weak("Add a tile to begin painting.");
@@ -469,16 +507,21 @@ impl TilerApp {
         );
         ui.weak("Left-drag paints · Right-drag erases to the closed-edge background");
 
+        let tile_orphans = tile_orphan_edges(orphan_edges, tile_id);
         match mode {
-            GridMode::Square => self.show_square_editor(ui, tile_id),
-            GridMode::Hex => self.show_hex_editor(ui, tile_id),
+            GridMode::Square => self.show_square_editor(ui, tile_id, tile_orphans),
+            GridMode::Hex => self.show_hex_editor(ui, tile_id, tile_orphans),
         }
     }
 
-    fn show_square_editor(&mut self, ui: &mut egui::Ui, tile_id: TileId) {
+    fn show_square_editor(
+        &mut self,
+        ui: &mut egui::Ui,
+        tile_id: TileId,
+        orphan_edges: OrphanEdges,
+    ) {
         ui.weak("Linked border painting is active; matching and reversed edges update together.");
 
-        let orphan_edges = self.tile_orphan_edges(tile_id);
         self.show_square_edge_assistant(ui, orphan_edges);
 
         let editor_size = Vec2::splat(SQUARE_RASTER_SIZE as f32 * EDITOR_PIXEL_SIZE);
@@ -499,10 +542,9 @@ impl TilerApp {
         }
     }
 
-    fn show_hex_editor(&mut self, ui: &mut egui::Ui, tile_id: TileId) {
+    fn show_hex_editor(&mut self, ui: &mut egui::Ui, tile_id: TileId, orphan_edges: OrphanEdges) {
         ui.weak("Linked border painting is active; matching and reversed edges update together.");
 
-        let orphan_edges = self.tile_orphan_edges(tile_id);
         self.show_hex_edge_assistant(ui, orphan_edges);
 
         let (response, painter) = ui.allocate_painter(hex_editor_size(), Sense::drag());
@@ -521,7 +563,8 @@ impl TilerApp {
                 Color32::WHITE,
             );
         }
-        let polygon = regular_hex_points(response.rect.center(), response.rect.height() * 0.5);
+        let bounds = hex_cell_bounds(response.rect);
+        let polygon = regular_hex_points(bounds.center(), bounds.height() * 0.5);
         painter.add(Shape::closed_line(
             polygon.to_vec(),
             Stroke::new(1.0, Color32::from_gray(130)),
@@ -628,15 +671,6 @@ impl TilerApp {
             version,
             texture,
         });
-    }
-
-    /// Per-side orphan flags for one tile of the active mode.
-    fn tile_orphan_edges(&self, tile: TileId) -> OrphanEdges {
-        self.model
-            .orphan_edges()
-            .into_iter()
-            .find_map(|(candidate, edges)| (candidate == tile).then_some(edges))
-            .unwrap_or_default()
     }
 
     /// Drops one mode's source selection after its catalog changed underneath it.
@@ -1009,17 +1043,6 @@ impl TilerApp {
                         cell_texture_rect(mode, canvas, coord, self.cell_size),
                         variant,
                     );
-                    if mode == GridMode::Hex {
-                        paint_cell_outline(
-                            painter,
-                            mode,
-                            canvas,
-                            coord,
-                            self.cell_size,
-                            0.0,
-                            Stroke::new(1.0, Color32::from_gray(82)),
-                        );
-                    }
                     if pinned {
                         let badge = center
                             + match mode {
@@ -1066,6 +1089,14 @@ impl TilerApp {
     }
 }
 
+fn build_variant_texture(ctx: &egui::Context, index: usize, image: &VariantImage) -> TextureHandle {
+    ctx.load_texture(
+        format!("variant-{index}"),
+        ColorImage::from_rgba_unmultiplied(image.size(), image.rgba()),
+        TextureOptions::NEAREST,
+    )
+}
+
 fn editor_pixel(canvas: Rect, pointer: Pos2) -> Option<Coord2> {
     let local = pointer - canvas.min;
     let extent = SQUARE_RASTER_SIZE as f32 * EDITOR_PIXEL_SIZE;
@@ -1078,9 +1109,51 @@ fn editor_pixel(canvas: Rect, pointer: Pos2) -> Option<Coord2> {
     ))
 }
 
-/// The pointy-top footprint of the hex sample editor.
+/// The rect an exported hex image must fill to depict a cell of `bounds`.
+///
+/// Hex samples are points on a lattice whose outermost ring lies exactly on the
+/// cell boundary, but a renderer maps each texel to a *block* of its destination
+/// rect. Inflating the bounds by half a texel on every side puts sample centers
+/// back on the cell's true geometry, so neighboring cells' opaque borders meet
+/// instead of leaving transparent notches along the slanted sides.
+///
+/// The resulting one-texel overlap is invisible: facing strips are byte-identical
+/// by the matching contract, and only boundary samples of either cell reach into
+/// the overlap band.
+fn hex_image_rect(bounds: Rect) -> Rect {
+    let [width, height] = HexRaster::IMAGE_SIZE;
+    let [span_x, span_y] = HexRaster::SAMPLE_SPAN;
+    Rect::from_center_size(
+        bounds.center(),
+        Vec2::new(
+            bounds.width() * width as f32 / span_x as f32,
+            bounds.height() * height as f32 / span_y as f32,
+        ),
+    )
+}
+
+/// The cell bounds an exported hex image depicts; the inverse of
+/// [`hex_image_rect`].
+fn hex_cell_bounds(image: Rect) -> Rect {
+    let [width, height] = HexRaster::IMAGE_SIZE;
+    let [span_x, span_y] = HexRaster::SAMPLE_SPAN;
+    Rect::from_center_size(
+        image.center(),
+        Vec2::new(
+            image.width() * span_x as f32 / width as f32,
+            image.height() * span_y as f32 / height as f32,
+        ),
+    )
+}
+
+/// The footprint of the hex sample editor, which allocates the image rect for a
+/// pointy-top cell of [`HEX_EDITOR_HEIGHT`].
 fn hex_editor_size() -> Vec2 {
-    Vec2::new(hex_width(HEX_EDITOR_HEIGHT), HEX_EDITOR_HEIGHT)
+    hex_image_rect(Rect::from_min_size(
+        Pos2::ZERO,
+        Vec2::new(hex_width(HEX_EDITOR_HEIGHT), HEX_EDITOR_HEIGHT),
+    ))
+    .size()
 }
 
 /// Maps a pointer position to the hex sample drawn under it.
@@ -1287,6 +1360,14 @@ fn edge_assistant_controls<D: Direction>(
 /// Counts the sides of one tile that have no partner to match.
 fn orphan_count(orphan_edges: OrphanEdges) -> usize {
     orphan_edges.iter().filter(|orphan| **orphan).count()
+}
+
+/// Picks one tile's per-side orphan flags out of the catalog-wide report.
+fn tile_orphan_edges(orphan_edges: &[(TileId, OrphanEdges)], tile: TileId) -> OrphanEdges {
+    orphan_edges
+        .iter()
+        .find_map(|(candidate, edges)| (*candidate == tile).then_some(*edges))
+        .unwrap_or_default()
 }
 
 /// Outlines the orphaned sides of the hex editor polygon.
@@ -1549,10 +1630,10 @@ fn square_rect(canvas: Rect, coord: Coord2, cell_size: f32) -> Rect {
 fn cell_texture_rect(mode: GridMode, canvas: Rect, coord: Coord2, cell_size: f32) -> Rect {
     match mode {
         GridMode::Square => square_rect(canvas, coord, cell_size),
-        GridMode::Hex => Rect::from_center_size(
+        GridMode::Hex => hex_image_rect(Rect::from_center_size(
             cell_center(mode, canvas, coord, cell_size),
             Vec2::new(hex_width(cell_size), cell_size),
-        ),
+        )),
     }
 }
 
@@ -1560,9 +1641,10 @@ fn preview_texture_rect(mode: GridMode, rect: Rect, margin: f32) -> Rect {
     let height = (rect.height() - 2.0 * margin).max(0.0);
     match mode {
         GridMode::Square => Rect::from_center_size(rect.center(), Vec2::splat(height)),
-        GridMode::Hex => {
-            Rect::from_center_size(rect.center(), Vec2::new(hex_width(height), height))
-        }
+        GridMode::Hex => hex_image_rect(Rect::from_center_size(
+            rect.center(),
+            Vec2::new(hex_width(height), height),
+        )),
     }
 }
 
@@ -1580,7 +1662,7 @@ fn paint_preview_cell(
         }
         GridMode::Hex => {
             painter.add(Shape::convex_polygon(
-                regular_hex_points(rect.center(), 22.0).to_vec(),
+                regular_hex_points(rect.center(), (rect.height() * 0.5 - 2.0).max(0.0)).to_vec(),
                 fill,
                 stroke,
             ));
@@ -1643,6 +1725,7 @@ fn paint_cell_outline(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::raster::TileSurface;
     use seamless_tiler::{D4, D6};
 
     #[test]
@@ -1791,11 +1874,130 @@ mod tests {
         );
     }
 
+    /// The world position of one hex sample as the renderer draws it.
+    fn sample_position(canvas: Rect, coord: Coord2, cell_size: f32, sample: Coord2) -> Pos2 {
+        let image = cell_texture_rect(GridMode::Hex, canvas, coord, cell_size);
+        let [width, height] = HexRaster::IMAGE_SIZE;
+        let [x, y] = HexRaster::sample_texel(sample);
+        image.min
+            + Vec2::new(
+                (x as f32 + 0.5) / width as f32 * image.width(),
+                (y as f32 + 0.5) / height as f32 * image.height(),
+            )
+    }
+
+    /// Facing sides carry equal strips, so their samples must also land on the
+    /// same points; otherwise matching art would still be drawn discontinuously.
+    #[test]
+    fn hex_edge_samples_meet_their_neighbour_index_for_index() {
+        let extent = Extent2::new(4, 4);
+        let cell_size = 64.0;
+        let canvas = Rect::from_min_size(
+            Pos2::new(10.0, 20.0),
+            canvas_size(GridMode::Hex, extent, cell_size),
+        );
+        let coord = Coord2::new(1, 1);
+
+        for direction in HexDirection::ALL.iter().copied() {
+            let offset = direction.offset(coord.y);
+            let neighbor = Coord2::new(coord.x + offset.x, coord.y + offset.y);
+            for index in 0..HexRaster::EDGE_SAMPLES {
+                let near = sample_position(
+                    canvas,
+                    coord,
+                    cell_size,
+                    HexRaster::edge_sample(direction, index),
+                );
+                let far = sample_position(
+                    canvas,
+                    neighbor,
+                    cell_size,
+                    HexRaster::edge_sample(direction.opposite(), index),
+                );
+                assert!(
+                    (near - far).length() < 0.001,
+                    "{direction:?} sample {index} lands at {near:?} but its partner at {far:?}",
+                );
+            }
+        }
+    }
+
+    /// Probes a cell's interior against the opaque texels of the cell itself and
+    /// every neighbour, which is exactly what a viewer sees along the seams.
+    #[test]
+    fn hex_cell_textures_cover_their_cell_without_gaps() {
+        let extent = Extent2::new(5, 5);
+        let cell_size = 64.0;
+        let canvas = Rect::from_min_size(
+            Pos2::new(10.0, 20.0),
+            canvas_size(GridMode::Hex, extent, cell_size),
+        );
+        let coord = Coord2::new(2, 2);
+        let center = cell_center(GridMode::Hex, canvas, coord, cell_size);
+        let polygon = hex_points(canvas, coord, cell_size, 0.0);
+
+        // The cell itself plus its six neighbours: nothing else can reach it.
+        let mut cells = vec![coord];
+        cells.extend(HexDirection::ALL.iter().copied().map(|direction| {
+            let offset = direction.offset(coord.y);
+            Coord2::new(coord.x + offset.x, coord.y + offset.y)
+        }));
+
+        let opaque_at = |cell: Coord2, point: Pos2| -> Option<Coord2> {
+            let image = cell_texture_rect(GridMode::Hex, canvas, cell, cell_size);
+            let [width, height] = HexRaster::IMAGE_SIZE;
+            let local = point - image.min;
+            if local.x < 0.0
+                || local.y < 0.0
+                || local.x >= image.width()
+                || local.y >= image.height()
+            {
+                return None;
+            }
+            HexRaster::sample_at_texel(
+                (local.x / image.width() * width as f32).floor() as i32,
+                (local.y / image.height() * height as f32).floor() as i32,
+            )
+        };
+
+        // Probe like real pixel centers: offset by an irrational-ish fraction so
+        // no probe lands exactly on a texel boundary, where which side wins is a
+        // measure-zero tie rather than a gap a viewer could see.
+        let steps = 140;
+        let (mut probes, mut gaps) = (0, 0);
+        for row in 0..steps {
+            for column in 0..steps {
+                let point = center
+                    + Vec2::new(
+                        (column as f32 + 0.437) / steps as f32 - 0.5,
+                        (row as f32 + 0.319) / steps as f32 - 0.5,
+                    ) * Vec2::new(hex_width(cell_size), cell_size);
+                if !point_in_convex_polygon(point, &polygon) {
+                    continue;
+                }
+                probes += 1;
+                if !cells.iter().any(|cell| opaque_at(*cell, point).is_some()) {
+                    gaps += 1;
+                }
+            }
+        }
+        assert!(
+            probes > 10_000,
+            "the probe grid must actually cover the cell"
+        );
+        assert_eq!(
+            gaps, 0,
+            "{gaps} of {probes} probes fell in a transparent seam",
+        );
+    }
+
     #[test]
     fn uncertainty_colors_distinguish_small_and_large_domains() {
         assert_ne!(uncertainty_color(2, 13), uncertainty_color(13, 13));
     }
 
+    /// The drawn rect is the *image* rect, so the cell it depicts is what must
+    /// match the pointy-top bounds.
     #[test]
     fn hex_texture_rect_matches_the_pointy_top_cell_bounds() {
         let canvas = Rect::from_min_size(Pos2::new(10.0, 20.0), Vec2::new(500.0, 500.0));
@@ -1805,18 +2007,39 @@ mod tests {
             rect.center(),
             cell_center(GridMode::Hex, canvas, coord, 64.0)
         );
-        assert!((rect.width() - hex_width(64.0)).abs() < 0.0001);
-        assert!((rect.height() - 64.0).abs() < 0.0001);
+
+        let bounds = hex_cell_bounds(rect);
+        assert!((bounds.width() - hex_width(64.0)).abs() < 0.0001);
+        assert!((bounds.height() - 64.0).abs() < 0.0001);
+        // The image overhangs the cell by exactly half a texel per side.
+        let [width, height] = HexRaster::IMAGE_SIZE;
+        assert!(
+            (rect.width() - bounds.width() - bounds.width() / (width - 1) as f32).abs() < 0.001
+        );
+        assert!(
+            (rect.height() - bounds.height() - bounds.height() / (height - 1) as f32).abs() < 0.001
+        );
+    }
+
+    #[test]
+    fn hex_image_rect_round_trips_cell_bounds() {
+        let bounds =
+            Rect::from_center_size(Pos2::new(31.0, 47.0), Vec2::new(hex_width(64.0), 64.0));
+        let restored = hex_cell_bounds(hex_image_rect(bounds));
+        assert!((restored.width() - bounds.width()).abs() < 0.001);
+        assert!((restored.height() - bounds.height()).abs() < 0.001);
+        assert_eq!(restored.center(), bounds.center());
+        assert!(hex_image_rect(bounds).contains_rect(bounds));
     }
 
     #[test]
     fn preview_texture_rect_preserves_each_mode_aspect_ratio() {
         let rect = Rect::from_min_size(Pos2::new(4.0, 8.0), Vec2::splat(48.0));
         let square = preview_texture_rect(GridMode::Square, rect, 4.0);
-        let hex = preview_texture_rect(GridMode::Hex, rect, 4.0);
+        let hex = hex_cell_bounds(preview_texture_rect(GridMode::Hex, rect, 4.0));
         assert_eq!(square.size(), Vec2::splat(40.0));
-        assert!((hex.height() - 40.0).abs() < f32::EPSILON);
-        assert!((hex.width() - hex_width(40.0)).abs() < f32::EPSILON);
+        assert!((hex.height() - 40.0).abs() < 0.001);
+        assert!((hex.width() - hex_width(40.0)).abs() < 0.001);
         assert_eq!(hex.center(), rect.center());
     }
 

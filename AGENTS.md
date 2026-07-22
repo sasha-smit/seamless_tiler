@@ -22,7 +22,10 @@ square and hex sample surfaces behind the shared `TileSurface` shape contract,
 edge families, sample link components, orphan detection, and atomic edge copy
 planning), `src/model.rs` owns the independent session-only square and hex WFC
 configurations and tile adapters, and `src/app.rs` owns egui controls,
-mode-aware geometry, hit testing, and canvas painting.
+mode-aware geometry, hit testing, and canvas painting. `src/app/contact_sheet.rs`
+is a test-only offscreen renderer that composites variant images through the
+real geometry helpers, so seam coverage and orientation layout stay assertable
+without a window.
 
 Unit tests live beside their implementation in `#[cfg(test)]` modules. Crate-level
 examples are doctests in `src/lib.rs`. There are currently no runtime assets;
@@ -40,6 +43,25 @@ tiles and applies demo-specific policies such as closed bounded edges. The UI
 may depend on the library, but the library must not depend on eframe, egui, wgpu,
 or UI-specific payloads. Keep the native UI session-only unless persistence or a
 project format is explicitly designed.
+
+Each tile's raster is the single authority for both its appearance and its
+matching. `SquareRaster` and `HexRaster` implement the shared `TileSurface`
+contract, sockets are always `EdgeStrip<Rgba>` re-extracted from the raster's
+border after an edit, and boolean sockets no longer exist. The procedural
+generators in `raster.rs` only seed demo tiles; never reintroduce them as a
+parallel source of truth. Deduplicate orientations by the complete transformed
+raster, and derive variants per tile so a pencil stroke only re-derives the
+tiles it changed.
+
+Hex samples are *points* on an axial lattice, not areas: the outermost ring lies
+on the cell boundary and each corner is one sample shared by two sides. A hex
+image therefore spans one texel more than the cell it depicts and must be drawn
+into bounds inflated by `IMAGE_SIZE / SAMPLE_SPAN` (`hex_image_rect`), or
+neighboring cells leave transparent notches along the slanted seams. The
+resulting one-texel overlap is invisible because facing strips are byte-identical.
+Use nearest filtering only, never resample a raster to rotate it, and keep
+export, editor hit testing, and overlays all going through
+`HexRaster::sample_at_texel` so they cannot disagree.
 
 `HexTopology` uses dense odd-row offset `Coord2` coordinates: odd rows are
 visually shifted half a cell to the right. Keep wrapped neighbor relationships
@@ -90,7 +112,17 @@ methods rather than egui callbacks where practical. Manually smoke-test native
 window creation, switching between square and hex modes without losing either
 session, allowed-orientation toggles, inspect/pin/unpin tools, polygon hit
 testing, resizing, bounded and independently wrapped axes, seed reset and retry,
-and step/run/pause/finish playback after altering interactive behavior.
+and step/run/pause/finish playback after altering interactive behavior. Also
+smoke-test pencil painting and erasing in both modes, per-mode brush size,
+adding, selecting, renaming, recoloring and deleting tiles, orphan diagnostics,
+edge-assistant copy including its reversed, no-op, invalid and conflicting
+cases, and solved-grid seams at both ends of the cell-size slider.
+
+Check rendering changes offscreen rather than by eye alone: set
+`TILER_CONTACT_SHEET` to a directory and run the UI tests to write PPM sheets of
+every tile orientation and of solved bounded and wrapped grids. That test also
+asserts no drawn grid encloses an uncovered background pixel, which is what a
+transparent seam looks like to a viewer.
 
 ## Commit & Pull Request Guidelines
 

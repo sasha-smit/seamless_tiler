@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 
 use seamless_tiler::{
@@ -338,8 +338,10 @@ struct Session<M: ModeSpec> {
     boundaries: AxisBoundaries,
     tiles: TileSet<M::Payload, M::Direction, M::Socket>,
     variants: Vec<OrientedTileId<M::Transform>>,
-    variant_sockets: Vec<Vec<M::Socket>>,
-    variant_images: Vec<VariantImage>,
+    /// Per-tile derived variants, indexed by tile index.
+    derived: Vec<TileVariants<M>>,
+    /// Each variant's `(tile index, slot)` position inside [`Self::derived`].
+    variant_slots: Vec<(usize, usize)>,
     enabled: Vec<bool>,
     pattern_variants: Vec<usize>,
     wave: Option<Wfc<M::Topology>>,
@@ -362,16 +364,17 @@ impl<M: ModeSpec> Session<M> {
         );
         let tiles = M::demo_tiles();
         let selected_tile = (!tiles.is_empty()).then_some(TileId::new(0));
-        let derived = distinct_variants::<M>(&tiles);
+        let mut derived = Vec::new();
+        let (variants, variant_slots) = refresh_derived::<M>(&tiles, &mut derived);
         let mut session = Self {
             pins: Grid::filled(extent, None).expect("editor dimensions have a valid area"),
             topology: M::topology(extent, AxisBoundaries::BOUNDED),
             boundaries: AxisBoundaries::BOUNDED,
-            enabled: vec![true; derived.variants.len()],
+            enabled: vec![true; variants.len()],
             tiles,
-            variants: derived.variants,
-            variant_sockets: derived.sockets,
-            variant_images: derived.images,
+            variants,
+            derived,
+            variant_slots,
             pattern_variants: Vec::new(),
             wave: None,
             seed: M::default_seed(),
@@ -516,8 +519,9 @@ impl<M: ModeSpec> Session<M> {
         let Some(value) = self.tiles.get_mut(tile) else {
             return;
         };
+        // Tile color tints the canvas chrome, not the raster, so only the
+        // version needs to move; the derived images are unchanged.
         if M::set_color(value, color) {
-            self.refresh_variant_images();
             self.version = self.version.wrapping_add(1);
         }
     }
@@ -531,8 +535,7 @@ impl<M: ModeSpec> Session<M> {
         let old_variants = std::mem::take(&mut self.variants);
         let old_enabled = std::mem::take(&mut self.enabled);
 
-        let derived = distinct_variants::<M>(&self.tiles);
-        let variants = derived.variants;
+        let (variants, variant_slots) = refresh_derived::<M>(&self.tiles, &mut self.derived);
 
         let new_index_of: HashMap<OrientedTileId<M::Transform>, usize> = variants
             .iter()
@@ -572,29 +575,21 @@ impl<M: ModeSpec> Session<M> {
         }
 
         self.variants = variants;
-        self.variant_sockets = derived.sockets;
-        self.variant_images = derived.images;
+        self.variant_slots = variant_slots;
         self.enabled = enabled;
         self.version = self.version.wrapping_add(1);
         self.rebuild_wave();
     }
 
-    fn refresh_variant_images(&mut self) {
-        self.variant_images = self
-            .variants
-            .iter()
-            .map(|variant| {
-                let tile = self
-                    .tiles
-                    .get(variant.tile)
-                    .expect("catalog variants refer to existing tiles");
-                M::variant_image(tile, variant.transform)
-            })
-            .collect();
+    fn variant_image(&self, index: usize) -> Option<&VariantImage> {
+        let (tile, slot) = *self.variant_slots.get(index)?;
+        Some(&self.derived[tile].images[slot])
     }
 
-    fn variant_image(&self, index: usize) -> Option<&VariantImage> {
-        self.variant_images.get(index)
+    /// One variant's socket for every direction, in direction index order.
+    fn variant_sockets(&self, index: usize) -> &[M::Socket] {
+        let (tile, slot) = self.variant_slots[index];
+        &self.derived[tile].sockets[slot]
     }
 
     fn variant_count(&self) -> usize {
@@ -780,74 +775,122 @@ impl<M: ModeSpec> Session<M> {
             let tile = self.variants[*variant_index].tile;
             1.0 / enabled_per_tile[tile.index()] as f64
         });
+        // Borrow each enabled pattern's sockets once instead of cloning them out
+        // of the per-tile cache on every rebuild.
+        let pattern_sockets: Vec<&[M::Socket]> = self
+            .pattern_variants
+            .iter()
+            .map(|variant_index| self.variant_sockets(*variant_index))
+            .collect();
         let rules = WfcRules::new(weights, |direction: M::Direction, source, neighbor| {
-            let source = self.pattern_variants[source.index()];
-            let neighbor = self.pattern_variants[neighbor.index()];
             EqualityMatcher.matches(
                 direction,
-                &self.variant_sockets[source][direction.index()],
-                &self.variant_sockets[neighbor][direction.opposite().index()],
+                &pattern_sockets[source.index()][direction.index()],
+                &pattern_sockets[neighbor.index()][direction.opposite().index()],
             )
         })
         .expect("enabled catalog patterns have valid weights");
 
         let topology = self.topology;
+        let pins = &self.pins;
+        let pattern_variants = &self.pattern_variants;
         let wave = Wfc::with_constraints(topology, rules, self.seed, |cell, pattern| {
-            let variant_index = self.pattern_variants[pattern.index()];
+            let variant_index = pattern_variants[pattern.index()];
             let pin_matches = topology
                 .coordinate(cell)
-                .and_then(|coord| self.pins.get(coord))
+                .and_then(|coord| pins.get(coord))
                 .is_none_or(|pin| pin.is_none_or(|pin| pin == variant_index));
             pin_matches
                 && M::Direction::ALL.iter().copied().all(|direction| {
                     topology.neighbor(cell, direction).is_some()
-                        || M::boundary_allows(
-                            &self.variant_sockets[variant_index][direction.index()],
-                        )
+                        || M::boundary_allows(&pattern_sockets[pattern.index()][direction.index()])
                 })
         });
         self.wave = Some(wave);
     }
 }
 
-struct DerivedVariants<M: ModeSpec> {
-    variants: Vec<OrientedTileId<M::Transform>>,
+/// One tile's distinct oriented variants, derived from its surface alone.
+///
+/// Transforming and exporting every orientation dominates the cost of a catalog
+/// refresh, and a pencil stroke changes exactly one tile, so each entry records
+/// the surface it came from and is reused until that surface actually changes.
+struct TileVariants<M: ModeSpec> {
+    surface: M::Surface,
+    transforms: Vec<M::Transform>,
     sockets: Vec<Vec<M::Socket>>,
     images: Vec<VariantImage>,
 }
 
-fn distinct_variants<M: ModeSpec>(
-    tiles: &TileSet<M::Payload, M::Direction, M::Socket>,
-) -> DerivedVariants<M> {
-    let mut variants = Vec::new();
+fn derive_tile_variants<M: ModeSpec>(
+    tile: &Tile<M::Payload, M::Direction, M::Socket>,
+) -> TileVariants<M> {
+    // A variant image holds every authoritative sample, so equal images mean
+    // equal oriented rasters. Comparing images deduplicates orientations while
+    // transforming each raster exactly once. Hashing rather than scanning keeps
+    // this from costing a quadratic pile of image comparisons.
+    let mut representatives: HashSet<VariantImage> = HashSet::new();
+    let mut transforms = Vec::new();
     let mut sockets = Vec::new();
     let mut images = Vec::new();
-    for (tile_id, tile) in tiles.iter() {
-        // A variant image holds every authoritative sample, so equal images mean
-        // equal oriented rasters. Comparing images deduplicates orientations
-        // while transforming each raster exactly once.
-        let mut representatives: Vec<VariantImage> = Vec::new();
-        for transform in M::transforms().iter().copied() {
-            let image = M::variant_image(tile, transform);
-            if representatives.contains(&image) {
-                continue;
-            }
-            representatives.push(image.clone());
-            let signature = M::Direction::ALL
+    for transform in M::transforms().iter().copied() {
+        let image = M::variant_image(tile, transform);
+        if !representatives.insert(image.clone()) {
+            continue;
+        }
+        transforms.push(transform);
+        sockets.push(
+            M::Direction::ALL
                 .iter()
                 .copied()
                 .map(|direction| M::oriented_socket(tile, transform, direction))
-                .collect();
-            variants.push(OrientedTileId::new(tile_id, transform));
-            sockets.push(signature);
-            images.push(image);
-        }
+                .collect(),
+        );
+        images.push(image);
     }
-    DerivedVariants {
-        variants,
+    TileVariants {
+        surface: M::surface(&tile.payload).clone(),
+        transforms,
         sockets,
         images,
     }
+}
+
+/// The flat variant list and each variant's position in the per-tile cache.
+type FlatVariants<M> = (
+    Vec<OrientedTileId<<M as ModeSpec>::Transform>>,
+    Vec<(usize, usize)>,
+);
+
+/// Brings `cache` back in step with `tiles`, re-deriving only the tiles whose
+/// surface changed, and returns the flat variant list built from it.
+///
+/// A stale entry costs one re-derivation and never a wrong answer, so tile
+/// renumbering after a deletion is safe without any remapping.
+fn refresh_derived<M: ModeSpec>(
+    tiles: &TileSet<M::Payload, M::Direction, M::Socket>,
+    cache: &mut Vec<TileVariants<M>>,
+) -> FlatVariants<M> {
+    let mut variants = Vec::new();
+    let mut slots = Vec::new();
+    for (index, (tile_id, tile)) in tiles.iter().enumerate() {
+        if !cache
+            .get(index)
+            .is_some_and(|entry| entry.surface == *M::surface(&tile.payload))
+        {
+            let derived = derive_tile_variants::<M>(tile);
+            match cache.get_mut(index) {
+                Some(entry) => *entry = derived,
+                None => cache.push(derived),
+            }
+        }
+        for (slot, transform) in cache[index].transforms.iter().copied().enumerate() {
+            variants.push(OrientedTileId::new(tile_id, transform));
+            slots.push((index, slot));
+        }
+    }
+    cache.truncate(tiles.len());
+    (variants, slots)
 }
 
 fn square_tile(
@@ -1795,7 +1838,7 @@ mod tests {
         let observations = model.observations();
         let status = model.status();
         let raster_before = model.variant_image(0).cloned().unwrap();
-        let sockets_before = model.square.variant_sockets[0].clone();
+        let sockets_before = model.square.variant_sockets(0).to_vec();
 
         model.set_tile_name(TileId::new(0), "Empty".to_owned());
         model.set_tile_color(TileId::new(0), [1, 2, 3]);
@@ -1806,7 +1849,7 @@ mod tests {
         assert_eq!(style.name, "Empty");
         assert_eq!(style.color, [1, 2, 3]);
         assert_eq!(model.variant_image(0).unwrap(), &raster_before);
-        assert_eq!(model.square.variant_sockets[0], sockets_before);
+        assert_eq!(model.square.variant_sockets(0), sockets_before);
     }
 
     #[test]
@@ -2056,11 +2099,13 @@ mod tests {
         let mut tiles = TileSet::new();
         tiles.insert(tile);
 
-        let derived = distinct_variants::<SquareMode>(&tiles);
-        assert_eq!(derived.variants.len(), 8);
-        let distinct = derived
+        let mut cache = Vec::new();
+        let (variants, _) = refresh_derived::<SquareMode>(&tiles, &mut cache);
+        assert_eq!(variants.len(), 8);
+        let distinct = cache[0]
             .images
-            .into_iter()
+            .iter()
+            .cloned()
             .collect::<std::collections::HashSet<_>>();
         assert_eq!(distinct.len(), 8);
     }
@@ -2077,11 +2122,13 @@ mod tests {
         let mut tiles = TileSet::new();
         tiles.insert(tile);
 
-        let derived = distinct_variants::<HexMode>(&tiles);
-        assert_eq!(derived.variants.len(), 12);
-        let distinct = derived
+        let mut cache = Vec::new();
+        let (variants, _) = refresh_derived::<HexMode>(&tiles, &mut cache);
+        assert_eq!(variants.len(), 12);
+        let distinct = cache[0]
             .images
-            .into_iter()
+            .iter()
+            .cloned()
             .collect::<std::collections::HashSet<_>>();
         assert_eq!(distinct.len(), 12);
     }
@@ -2191,7 +2238,7 @@ mod tests {
                 panic!("a solved cell must be collapsed");
             };
             for direction in SquareDirection::ALL.iter().copied() {
-                let source_edge = &session.variant_sockets[source][direction.index()];
+                let source_edge = &session.variant_sockets(source)[direction.index()];
                 if let Some(neighbor_cell) = session.topology.neighbor(cell, direction) {
                     let neighbor_coord = session.topology.coordinate(neighbor_cell).unwrap();
                     let CellVisual::Collapsed {
@@ -2202,7 +2249,7 @@ mod tests {
                     };
                     assert_eq!(
                         source_edge,
-                        &session.variant_sockets[neighbor][direction.opposite().index()],
+                        &session.variant_sockets(neighbor)[direction.opposite().index()],
                         "cell {coord:?} toward {direction:?}"
                     );
                 } else {
@@ -2236,7 +2283,7 @@ mod tests {
                 panic!("a solved cell must be collapsed");
             };
             for direction in HexDirection::ALL.iter().copied() {
-                let source_edge = &session.variant_sockets[source][direction.index()];
+                let source_edge = &session.variant_sockets(source)[direction.index()];
                 if let Some(neighbor_cell) = session.topology.neighbor(cell, direction) {
                     let neighbor_coord = session.topology.coordinate(neighbor_cell).unwrap();
                     let CellVisual::Collapsed {
@@ -2247,7 +2294,7 @@ mod tests {
                     };
                     assert_eq!(
                         source_edge,
-                        &session.variant_sockets[neighbor][direction.opposite().index()],
+                        &session.variant_sockets(neighbor)[direction.opposite().index()],
                         "cell {coord:?} toward {direction:?}"
                     );
                 } else {
