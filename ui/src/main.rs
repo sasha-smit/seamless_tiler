@@ -1,6 +1,7 @@
 mod app;
 mod model;
 mod raster;
+mod seams;
 
 use eframe::egui;
 

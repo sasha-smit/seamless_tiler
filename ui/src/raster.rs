@@ -16,6 +16,33 @@ const HEX_IMAGE_HEIGHT: usize = HEX_STORAGE_SIZE;
 
 pub(crate) type Rgba = [u8; 4];
 
+/// The authoritative sample surface one editor mode paints and matches on.
+///
+/// Implementations expose their border geometry so the seamlessness assistant can
+/// link, copy, and diagnose sides without knowing the cell shape. Every side
+/// carries the same number of ordered samples, and each corner sample is shared
+/// with the adjoining side so linked families stay transitive through corners.
+pub(crate) trait TileSurface: Clone + PartialEq {
+    type Direction: Direction;
+
+    /// The number of ordered samples on every side.
+    const EDGE_SAMPLES: usize;
+
+    /// Returns the sample at `index` along one side, in canonical order.
+    ///
+    /// Panics if `index` is not below [`Self::EDGE_SAMPLES`].
+    fn edge_sample(direction: Self::Direction, index: usize) -> Coord2;
+
+    /// Writes one sample, reporting whether it existed and changed.
+    fn set_sample(&mut self, coord: Coord2, color: Rgba) -> bool;
+
+    /// Re-extracts every side's ordered samples from the current picture.
+    fn edge_strips(&self) -> SocketMap<Self::Direction, EdgeStrip<Rgba>>;
+
+    /// Returns every sample covered by a continuous clipped brush stroke.
+    fn stroke(&self, from: Coord2, to: Coord2, brush_size: usize) -> Vec<Coord2>;
+}
+
 /// Rectangular RGBA data ready for upload to a renderer texture.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct VariantImage {
@@ -196,6 +223,36 @@ impl SquareRaster {
     }
 }
 
+impl TileSurface for SquareRaster {
+    type Direction = SquareDirection;
+
+    const EDGE_SAMPLES: usize = SQUARE_RASTER_SIZE;
+
+    fn edge_sample(direction: SquareDirection, index: usize) -> Coord2 {
+        assert!(index < Self::EDGE_SAMPLES, "edge sample index out of range");
+        let index = index as i32;
+        let far = (SQUARE_RASTER_SIZE - 1) as i32;
+        match direction {
+            SquareDirection::North => Coord2::new(index, 0),
+            SquareDirection::East => Coord2::new(far, index),
+            SquareDirection::South => Coord2::new(index, far),
+            SquareDirection::West => Coord2::new(0, index),
+        }
+    }
+
+    fn set_sample(&mut self, coord: Coord2, color: Rgba) -> bool {
+        self.set_pixel(coord, color)
+    }
+
+    fn edge_strips(&self) -> SocketMap<SquareDirection, EdgeStrip<Rgba>> {
+        self.edges()
+    }
+
+    fn stroke(&self, from: Coord2, to: Coord2, brush_size: usize) -> Vec<Coord2> {
+        self.stroke_pixels(from, to, brush_size)
+    }
+}
+
 /// A fixed pointy-top hexagonal RGBA image on an axial sample lattice.
 ///
 /// The rectangular backing grid contains transparent padding. Only coordinates
@@ -253,20 +310,21 @@ impl HexRaster {
         })
     }
 
-    pub(crate) fn edge_coordinates(direction: HexDirection) -> [Coord2; HEX_EDGE_SAMPLES] {
+    /// Returns one side's start vertex and its per-sample axial step.
+    fn edge_ray(direction: HexDirection) -> (Coord2, Coord2) {
         let k = HEX_EDGE_INTERVALS;
-        let (start, tangent) = match direction {
+        match direction {
             HexDirection::NorthEast => (Coord2::new(k, -2 * k), Coord2::new(1, 1)),
             HexDirection::East => (Coord2::new(2 * k, -k), Coord2::new(-1, 2)),
             HexDirection::SouthEast => (Coord2::new(k, k), Coord2::new(-2, 1)),
             HexDirection::SouthWest => (Coord2::new(-2 * k, k), Coord2::new(1, 1)),
             HexDirection::West => (Coord2::new(-k, -k), Coord2::new(-1, 2)),
             HexDirection::NorthWest => (Coord2::new(k, -2 * k), Coord2::new(-2, 1)),
-        };
-        std::array::from_fn(|index| {
-            let index = index as i32;
-            Coord2::new(start.x + tangent.x * index, start.y + tangent.y * index)
-        })
+        }
+    }
+
+    pub(crate) fn edge_coordinates(direction: HexDirection) -> [Coord2; HEX_EDGE_SAMPLES] {
+        std::array::from_fn(|index| Self::edge_sample(direction, index))
     }
 
     pub(crate) fn edge(&self, direction: HexDirection) -> EdgeStrip<Rgba> {
@@ -421,6 +479,31 @@ impl HexRaster {
     fn storage_to_axial(coord: Coord2) -> Coord2 {
         let offset = 2 * HEX_EDGE_INTERVALS;
         Coord2::new(coord.x - offset, coord.y - offset)
+    }
+}
+
+impl TileSurface for HexRaster {
+    type Direction = HexDirection;
+
+    const EDGE_SAMPLES: usize = HEX_EDGE_SAMPLES;
+
+    fn edge_sample(direction: HexDirection, index: usize) -> Coord2 {
+        assert!(index < Self::EDGE_SAMPLES, "edge sample index out of range");
+        let (start, tangent) = Self::edge_ray(direction);
+        let index = index as i32;
+        Coord2::new(start.x + tangent.x * index, start.y + tangent.y * index)
+    }
+
+    fn set_sample(&mut self, coord: Coord2, color: Rgba) -> bool {
+        self.set_pixel(coord, color)
+    }
+
+    fn edge_strips(&self) -> SocketMap<HexDirection, EdgeStrip<Rgba>> {
+        self.edges()
+    }
+
+    fn stroke(&self, from: Coord2, to: Coord2, brush_size: usize) -> Vec<Coord2> {
+        self.stroke_samples(from, to, brush_size)
     }
 }
 

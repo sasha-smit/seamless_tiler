@@ -8,10 +8,17 @@ use seamless_tiler::{
 };
 
 #[cfg(test)]
-use crate::raster::{DEFAULT_PAINT_COLOR, closed_edge, closed_hex_edge};
 use crate::raster::{
-    HexRaster, Rgba, SQUARE_RASTER_SIZE, SquareRaster, VariantImage, generate_hex_raster,
+    DEFAULT_PAINT_COLOR, EDGE_BACKGROUND, HEX_EDGE_SAMPLES, SQUARE_RASTER_SIZE, closed_edge,
+    closed_hex_edge,
+};
+use crate::raster::{
+    HexRaster, Rgba, SquareRaster, TileSurface, VariantImage, generate_hex_raster,
     generate_square_raster, is_closed_edge,
+};
+use crate::seams::{
+    EdgeCopyResult, EdgeLinkIndex, EdgeRef, HexEdgeRef, OrphanEdges, SquareEdgeRef, TileSample,
+    orphan_edges, plan_edge_copy,
 };
 
 pub(crate) const DEFAULT_EXTENT: Extent2 = Extent2::new(12, 8);
@@ -79,20 +86,6 @@ pub(crate) enum EditableRaster<'a> {
     Hex(&'a HexRaster),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct SquareEdgeRef {
-    pub(crate) tile: TileId,
-    pub(crate) direction: SquareDirection,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum EdgeCopyResult {
-    Applied,
-    NoChange,
-    Conflict,
-    Invalid,
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) enum CanvasTool {
     #[default]
@@ -115,6 +108,8 @@ trait ModeSpec: 'static {
     type Topology: Topology<Coord = Coord2, Direction = Self::Direction> + Copy;
     type Payload: Clone;
     type Socket: Clone + PartialEq;
+    /// The authoritative picture every tile of this mode owns.
+    type Surface: TileSurface<Direction = Self::Direction>;
 
     fn topology(extent: Extent2, boundaries: AxisBoundaries) -> Self::Topology;
     fn transforms() -> &'static [Self::Transform];
@@ -123,6 +118,8 @@ trait ModeSpec: 'static {
     fn new_tile(name: String) -> Tile<Self::Payload, Self::Direction, Self::Socket>;
     fn style(payload: &Self::Payload) -> &TileStyle;
     fn style_mut(payload: &mut Self::Payload) -> &mut TileStyle;
+    fn surface(payload: &Self::Payload) -> &Self::Surface;
+    fn surface_mut(payload: &mut Self::Payload) -> &mut Self::Surface;
     fn set_color(
         tile: &mut Tile<Self::Payload, Self::Direction, Self::Socket>,
         color: [u8; 3],
@@ -148,6 +145,7 @@ impl ModeSpec for SquareMode {
     type Topology = SquareTopology;
     type Payload = SquareTile;
     type Socket = EdgeStrip<Rgba>;
+    type Surface = SquareRaster;
 
     fn topology(extent: Extent2, boundaries: AxisBoundaries) -> Self::Topology {
         SquareTopology::new(extent, boundaries).expect("editor dimensions fit signed coordinates")
@@ -187,6 +185,14 @@ impl ModeSpec for SquareMode {
 
     fn style_mut(payload: &mut Self::Payload) -> &mut TileStyle {
         &mut payload.style
+    }
+
+    fn surface(payload: &Self::Payload) -> &Self::Surface {
+        &payload.raster
+    }
+
+    fn surface_mut(payload: &mut Self::Payload) -> &mut Self::Surface {
+        &mut payload.raster
     }
 
     fn set_color(
@@ -235,6 +241,7 @@ impl ModeSpec for HexMode {
     type Topology = HexTopology;
     type Payload = HexTile;
     type Socket = EdgeStrip<Rgba>;
+    type Surface = HexRaster;
 
     fn topology(extent: Extent2, boundaries: AxisBoundaries) -> Self::Topology {
         HexTopology::new(extent, boundaries).expect("editor dimensions fit signed coordinates")
@@ -277,6 +284,14 @@ impl ModeSpec for HexMode {
 
     fn style_mut(payload: &mut Self::Payload) -> &mut TileStyle {
         &mut payload.style
+    }
+
+    fn surface(payload: &Self::Payload) -> &Self::Surface {
+        &payload.raster
+    }
+
+    fn surface_mut(payload: &mut Self::Payload) -> &mut Self::Surface {
+        &mut payload.raster
     }
 
     fn set_color(
@@ -867,191 +882,15 @@ fn hex_tile(
     )
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct RasterPixel {
-    tile: TileId,
-    coord: Coord2,
-}
-
-struct EdgeLinkIndex {
-    component_by_pixel: HashMap<RasterPixel, usize>,
-    components: Vec<Vec<RasterPixel>>,
-}
-
-impl EdgeLinkIndex {
-    fn new(tiles: &TileSet<SquareTile, SquareDirection, EdgeStrip<Rgba>>) -> Self {
-        let families = square_edge_families(tiles);
-
-        let node_count = tiles.len() * SQUARE_RASTER_SIZE * SQUARE_RASTER_SIZE;
-        let mut sets = DisjointSets::new(node_count);
-        for members in families.values() {
-            let Some((first, first_reversed)) = members.first().copied() else {
-                continue;
-            };
-            for canonical_index in 0..SQUARE_RASTER_SIZE {
-                let first_index = aligned_edge_index(canonical_index, first_reversed);
-                let first_node = raster_node(first.tile, edge_pixel(first.direction, first_index));
-                for (edge, reversed_to_key) in members.iter().copied().skip(1) {
-                    let local_index = aligned_edge_index(canonical_index, reversed_to_key);
-                    let node = raster_node(edge.tile, edge_pixel(edge.direction, local_index));
-                    sets.union(first_node, node);
-                }
-            }
-        }
-
-        let mut grouped: HashMap<usize, Vec<RasterPixel>> = HashMap::new();
-        for tile_index in 0..tiles.len() {
-            let tile = TileId::new(tile_index);
-            for y in 0..SQUARE_RASTER_SIZE {
-                for x in 0..SQUARE_RASTER_SIZE {
-                    if x != 0
-                        && y != 0
-                        && x != SQUARE_RASTER_SIZE - 1
-                        && y != SQUARE_RASTER_SIZE - 1
-                    {
-                        continue;
-                    }
-                    let coord = Coord2::new(x as i32, y as i32);
-                    let root = sets.find(raster_node(tile, coord));
-                    grouped
-                        .entry(root)
-                        .or_default()
-                        .push(RasterPixel { tile, coord });
-                }
-            }
-        }
-
-        let mut component_by_pixel = HashMap::new();
-        let mut components = Vec::with_capacity(grouped.len());
-        for pixels in grouped.into_values() {
-            let component = components.len();
-            for pixel in &pixels {
-                component_by_pixel.insert(*pixel, component);
-            }
-            components.push(pixels);
-        }
-        Self {
-            component_by_pixel,
-            components,
-        }
-    }
-
-    fn linked_pixels(&self, pixel: RasterPixel) -> Option<&[RasterPixel]> {
-        let component = *self.component_by_pixel.get(&pixel)?;
-        Some(&self.components[component])
-    }
-}
-
-fn square_edge_families(
-    tiles: &TileSet<SquareTile, SquareDirection, EdgeStrip<Rgba>>,
-) -> HashMap<EdgeStrip<Rgba>, Vec<(SquareEdgeRef, bool)>> {
-    let mut families: HashMap<EdgeStrip<Rgba>, Vec<(SquareEdgeRef, bool)>> = HashMap::new();
-    for (tile_id, tile) in tiles.iter() {
-        for direction in SquareDirection::ALL.iter().copied() {
-            let edge = &tile.sockets[direction];
-            let reversed = edge.reversed();
-            let (key, reversed_to_key) = if reversed.as_slice() < edge.as_slice() {
-                (reversed, true)
-            } else {
-                (edge.clone(), false)
-            };
-            families.entry(key).or_default().push((
-                SquareEdgeRef {
-                    tile: tile_id,
-                    direction,
-                },
-                reversed_to_key,
-            ));
-        }
-    }
-    families
-}
-
-fn square_orphan_edges(
-    tiles: &TileSet<SquareTile, SquareDirection, EdgeStrip<Rgba>>,
-) -> Vec<(TileId, [bool; 4])> {
-    let mut family_sizes = vec![[0; 4]; tiles.len()];
-    for members in square_edge_families(tiles).into_values() {
-        for (edge, _) in &members {
-            family_sizes[edge.tile.index()][edge.direction.index()] = members.len();
-        }
-    }
-    family_sizes
-        .into_iter()
-        .enumerate()
-        .map(|(tile, sizes)| {
-            (
-                TileId::new(tile),
-                std::array::from_fn(|direction| sizes[direction] < 2),
-            )
-        })
-        .collect()
-}
-
-struct DisjointSets {
-    parents: Vec<usize>,
-    ranks: Vec<u8>,
-}
-
-impl DisjointSets {
-    fn new(len: usize) -> Self {
-        Self {
-            parents: (0..len).collect(),
-            ranks: vec![0; len],
-        }
-    }
-
-    fn find(&mut self, node: usize) -> usize {
-        if self.parents[node] != node {
-            self.parents[node] = self.find(self.parents[node]);
-        }
-        self.parents[node]
-    }
-
-    fn union(&mut self, left: usize, right: usize) {
-        let left = self.find(left);
-        let right = self.find(right);
-        if left == right {
-            return;
-        }
-        match self.ranks[left].cmp(&self.ranks[right]) {
-            std::cmp::Ordering::Less => self.parents[left] = right,
-            std::cmp::Ordering::Greater => self.parents[right] = left,
-            std::cmp::Ordering::Equal => {
-                self.parents[right] = left;
-                self.ranks[left] += 1;
-            }
-        }
-    }
-}
-
-fn aligned_edge_index(canonical_index: usize, reversed_to_key: bool) -> usize {
-    if reversed_to_key {
-        SQUARE_RASTER_SIZE - 1 - canonical_index
-    } else {
-        canonical_index
-    }
-}
-
-fn edge_pixel(direction: SquareDirection, index: usize) -> Coord2 {
-    match direction {
-        SquareDirection::North => Coord2::new(index as i32, 0),
-        SquareDirection::East => Coord2::new((SQUARE_RASTER_SIZE - 1) as i32, index as i32),
-        SquareDirection::South => Coord2::new(index as i32, (SQUARE_RASTER_SIZE - 1) as i32),
-        SquareDirection::West => Coord2::new(0, index as i32),
-    }
-}
-
-fn raster_node(tile: TileId, coord: Coord2) -> usize {
-    tile.index() * SQUARE_RASTER_SIZE * SQUARE_RASTER_SIZE
-        + coord.y as usize * SQUARE_RASTER_SIZE
-        + coord.x as usize
-}
-
-impl Session<SquareMode> {
-    fn selected_raster(&self) -> Option<&SquareRaster> {
+/// Editing operations that need the mode's surface geometry.
+///
+/// Border edits propagate through [`EdgeLinkIndex`], so painting or copying a
+/// side keeps every partner side — including reversed partners and the sides
+/// that meet it at a corner — byte-identical.
+impl<M: ModeSpec<Socket = EdgeStrip<Rgba>>> Session<M> {
+    fn selected_surface(&self) -> Option<&M::Surface> {
         let tile = self.selected_tile?;
-        self.tiles.get(tile).map(|tile| &tile.payload.raster)
+        self.tiles.get(tile).map(|tile| M::surface(&tile.payload))
     }
 
     fn paint_selected_tile(
@@ -1067,18 +906,18 @@ impl Session<SquareMode> {
         let Some(tile) = self.tiles.get(tile_id) else {
             return false;
         };
-        let stroke = tile.payload.raster.stroke_pixels(from, to, brush_size);
+        let stroke = M::surface(&tile.payload).stroke(from, to, brush_size);
         if stroke.is_empty() {
             return false;
         }
-        let links = EdgeLinkIndex::new(&self.tiles);
+        let links = EdgeLinkIndex::new::<M::Surface, _, _>(&self.tiles);
         let mut assignments = HashMap::new();
         for coord in stroke {
-            let source = RasterPixel {
+            let source = TileSample {
                 tile: tile_id,
                 coord,
             };
-            if let Some(linked) = links.linked_pixels(source) {
+            if let Some(linked) = links.linked_samples(source) {
                 for target in linked {
                     assignments.insert(*target, color);
                 }
@@ -1086,133 +925,49 @@ impl Session<SquareMode> {
                 assignments.insert(source, color);
             }
         }
-        self.apply_square_pixels(assignments)
+        self.apply_samples(assignments)
     }
 
-    fn orphan_edges(&self) -> Vec<(TileId, [bool; 4])> {
-        square_orphan_edges(&self.tiles)
+    fn orphan_edges(&self) -> Vec<(TileId, OrphanEdges)> {
+        orphan_edges::<M::Surface, _, _>(&self.tiles)
     }
 
     fn copy_edge(
         &mut self,
-        source: SquareEdgeRef,
-        target_direction: SquareDirection,
+        source: EdgeRef<M::Direction>,
+        target_direction: M::Direction,
         reverse: bool,
     ) -> EdgeCopyResult {
         let Some(target_tile) = self.selected_tile else {
             return EdgeCopyResult::Invalid;
         };
-        let Some(source_tile) = self.tiles.get(source.tile) else {
-            return EdgeCopyResult::Invalid;
+        let plan = plan_edge_copy::<M::Surface, _, _>(
+            &self.tiles,
+            source,
+            target_tile,
+            target_direction,
+            reverse,
+        );
+        let assignments = match plan {
+            Ok(assignments) => assignments,
+            Err(result) => return result,
         };
-        if self.tiles.get(target_tile).is_none() {
-            return EdgeCopyResult::Invalid;
-        }
-        let mut desired = source_tile.sockets[source.direction].clone();
-        if reverse {
-            desired = desired.reversed();
-        }
-
-        let links = EdgeLinkIndex::new(&self.tiles);
-        let mut assignments = HashMap::new();
-        for (index, color) in desired.iter().copied().enumerate() {
-            let target = RasterPixel {
-                tile: target_tile,
-                coord: edge_pixel(target_direction, index),
-            };
-            let Some(linked) = links.linked_pixels(target) else {
-                return EdgeCopyResult::Invalid;
-            };
-            for pixel in linked {
-                if assignments
-                    .insert(*pixel, color)
-                    .is_some_and(|existing| existing != color)
-                {
-                    return EdgeCopyResult::Conflict;
-                }
-            }
-        }
-
-        if self.apply_square_pixels(assignments) {
+        if self.apply_samples(assignments) {
             EdgeCopyResult::Applied
         } else {
             EdgeCopyResult::NoChange
         }
     }
 
-    fn apply_square_pixels(&mut self, assignments: HashMap<RasterPixel, Rgba>) -> bool {
-        let mut changed_tiles = vec![false; self.tiles.len()];
-        for (pixel, color) in assignments {
-            let Some(tile) = self.tiles.get_mut(pixel.tile) else {
-                continue;
-            };
-            if tile.payload.raster.set_pixel(pixel.coord, color) {
-                changed_tiles[pixel.tile.index()] = true;
-            }
-        }
-        if !changed_tiles.iter().any(|changed| *changed) {
-            return false;
-        }
-        for (tile_index, changed) in changed_tiles.into_iter().enumerate() {
-            if !changed {
-                continue;
-            }
-            let tile = self
-                .tiles
-                .get_mut(TileId::new(tile_index))
-                .expect("changed tile remains in the catalog");
-            tile.sockets = tile.payload.raster.edges();
-        }
-        self.refresh_catalog(Some);
-        true
-    }
-}
-
-impl Session<HexMode> {
-    fn selected_raster(&self) -> Option<&HexRaster> {
-        let tile = self.selected_tile?;
-        self.tiles.get(tile).map(|tile| &tile.payload.raster)
-    }
-
-    fn paint_selected_tile(
-        &mut self,
-        from: Coord2,
-        to: Coord2,
-        brush_size: usize,
-        color: Rgba,
-    ) -> bool {
-        let Some(tile_id) = self.selected_tile else {
-            return false;
-        };
-        let Some(tile) = self.tiles.get(tile_id) else {
-            return false;
-        };
-        let stroke = tile.payload.raster.stroke_samples(from, to, brush_size);
-        if stroke.is_empty() {
-            return false;
-        }
-        let assignments = stroke
-            .into_iter()
-            .map(|coord| {
-                (
-                    RasterPixel {
-                        tile: tile_id,
-                        coord,
-                    },
-                    color,
-                )
-            })
-            .collect();
-        self.apply_hex_samples(assignments)
-    }
-
-    fn apply_hex_samples(&mut self, assignments: HashMap<RasterPixel, Rgba>) -> bool {
+    /// Writes planned samples, re-extracts the sockets of every tile that
+    /// changed, and refreshes the catalog exactly once.
+    fn apply_samples(&mut self, assignments: HashMap<TileSample, Rgba>) -> bool {
         let mut changed_tiles = vec![false; self.tiles.len()];
         for (sample, color) in assignments {
             let Some(tile) = self.tiles.get_mut(sample.tile) else {
                 continue;
             };
-            if tile.payload.raster.set_pixel(sample.coord, color) {
+            if M::surface_mut(&mut tile.payload).set_sample(sample.coord, color) {
                 changed_tiles[sample.tile.index()] = true;
             }
         }
@@ -1227,7 +982,7 @@ impl Session<HexMode> {
                 .tiles
                 .get_mut(TileId::new(tile_index))
                 .expect("changed tile remains in the catalog");
-            tile.sockets = tile.payload.raster.edges();
+            tile.sockets = M::surface(&tile.payload).edge_strips();
         }
         self.refresh_catalog(Some);
         true
@@ -1271,6 +1026,7 @@ trait SessionAccess {
     fn variant_count(&self) -> usize;
     fn catalog_version(&self) -> u64;
     fn variants_for_tile(&self, tile: TileId) -> Vec<usize>;
+    fn orphan_edges(&self) -> Vec<(TileId, OrphanEdges)>;
     fn enabled_variant_count(&self) -> usize;
     fn seed(&self) -> u64;
     fn selected_tile(&self) -> Option<TileId>;
@@ -1307,7 +1063,7 @@ trait SessionAccess {
     fn toggle_running(&mut self);
 }
 
-impl<M: ModeSpec> SessionAccess for Session<M> {
+impl<M: ModeSpec<Socket = EdgeStrip<Rgba>>> SessionAccess for Session<M> {
     fn extent(&self) -> Extent2 {
         self.extent()
     }
@@ -1350,6 +1106,9 @@ impl<M: ModeSpec> SessionAccess for Session<M> {
             .enumerate()
             .filter_map(|(index, variant)| (variant.tile == tile).then_some(index))
             .collect()
+    }
+    fn orphan_edges(&self) -> Vec<(TileId, OrphanEdges)> {
+        self.orphan_edges()
     }
     fn enabled_variant_count(&self) -> usize {
         self.pattern_variants.len()
@@ -1548,16 +1307,13 @@ impl EditorModel {
     /// The selected tile's authoritative raster for the active mode, if any.
     pub(crate) fn selected_raster(&self) -> Option<EditableRaster<'_>> {
         match self.mode {
-            GridMode::Square => self.square.selected_raster().map(EditableRaster::Square),
-            GridMode::Hex => self.hex.selected_raster().map(EditableRaster::Hex),
+            GridMode::Square => self.square.selected_surface().map(EditableRaster::Square),
+            GridMode::Hex => self.hex.selected_surface().map(EditableRaster::Hex),
         }
     }
-    pub(crate) fn square_orphan_edges(&self) -> Vec<(TileId, [bool; 4])> {
-        if self.mode == GridMode::Square {
-            self.square.orphan_edges()
-        } else {
-            Vec::new()
-        }
+    /// Per-side orphan flags for every tile of the active mode.
+    pub(crate) fn orphan_edges(&self) -> Vec<(TileId, OrphanEdges)> {
+        self.active().orphan_edges()
     }
     pub(crate) fn selected_cell(&self) -> Option<Coord2> {
         self.active().selected_cell()
@@ -1645,7 +1401,9 @@ impl EditorModel {
             GridMode::Hex => self.hex.paint_selected_tile(from, to, brush_size, color),
         }
     }
-    pub(crate) fn copy_selected_edge(
+    /// Copies one square edge onto the selected square tile, rejecting the
+    /// request unless square mode is active.
+    pub(crate) fn copy_selected_square_edge(
         &mut self,
         source: SquareEdgeRef,
         target_direction: SquareDirection,
@@ -1655,6 +1413,19 @@ impl EditorModel {
             return EdgeCopyResult::Invalid;
         }
         self.square.copy_edge(source, target_direction, reverse)
+    }
+    /// Copies one hex edge onto the selected hex tile, rejecting the request
+    /// unless hex mode is active.
+    pub(crate) fn copy_selected_hex_edge(
+        &mut self,
+        source: HexEdgeRef,
+        target_direction: HexDirection,
+        reverse: bool,
+    ) -> EdgeCopyResult {
+        if self.mode != GridMode::Hex {
+            return EdgeCopyResult::Invalid;
+        }
+        self.hex.copy_edge(source, target_direction, reverse)
     }
     pub(crate) fn apply_tool(&mut self, coord: Coord2, secondary: bool) -> bool {
         self.active_mut().apply_tool(coord, secondary)
@@ -1720,7 +1491,7 @@ mod tests {
     ) {
         assert_eq!(samples.len(), SQUARE_RASTER_SIZE);
         for (index, color) in samples.iter().copied().enumerate() {
-            let coord = edge_pixel(direction, index);
+            let coord = SquareRaster::edge_sample(direction, index);
             tile.payload
                 .raster
                 .set(coord.x as usize, coord.y as usize, color);
@@ -1739,9 +1510,50 @@ mod tests {
         model
     }
 
-    fn orphan_edges(model: &EditorModel, tile: TileId) -> [bool; 4] {
+    /// An asymmetric hex strip whose corner samples stay closed, so writing it
+    /// onto one side never conflicts with the sides it meets at a corner.
+    fn hex_patterned_edge(seed: u8) -> Vec<Rgba> {
+        let mut edge = vec![EDGE_BACKGROUND; HEX_EDGE_SAMPLES];
+        for (index, sample) in edge
+            .iter_mut()
+            .enumerate()
+            .take(HEX_EDGE_SAMPLES - 1)
+            .skip(1)
+        {
+            *sample = [seed, index as u8, seed.wrapping_add(index as u8), 255];
+        }
+        edge
+    }
+
+    fn set_hex_edge(
+        tile: &mut Tile<HexTile, HexDirection, EdgeStrip<Rgba>>,
+        direction: HexDirection,
+        samples: &[Rgba],
+    ) {
+        assert_eq!(samples.len(), HEX_EDGE_SAMPLES);
+        for (index, color) in samples.iter().copied().enumerate() {
+            tile.payload
+                .raster
+                .set_pixel(HexRaster::edge_sample(direction, index), color);
+        }
+        tile.sockets = tile.payload.raster.edges();
+    }
+
+    fn model_with_hex_tiles(
+        tiles: TileSet<HexTile, HexDirection, EdgeStrip<Rgba>>,
+        selected: TileId,
+    ) -> EditorModel {
+        let mut model = EditorModel::new(Extent2::new(2, 2));
+        select_hex(&mut model);
+        model.hex.tiles = tiles;
+        model.hex.selected_tile = Some(selected);
+        model.hex.refresh_catalog(|_| None);
         model
-            .square_orphan_edges()
+    }
+
+    fn tile_orphan_edges(model: &EditorModel, tile: TileId) -> OrphanEdges {
+        model
+            .orphan_edges()
             .into_iter()
             .find_map(|(candidate, edges)| (candidate == tile).then_some(edges))
             .unwrap()
@@ -2045,8 +1857,8 @@ mod tests {
             first.sockets[SquareDirection::North],
             second.sockets[SquareDirection::East].reversed()
         );
-        assert!(!orphan_edges(&model, first_id)[SquareDirection::North.index()]);
-        assert!(!orphan_edges(&model, second_id)[SquareDirection::East.index()]);
+        assert!(!tile_orphan_edges(&model, first_id)[SquareDirection::North.index()]);
+        assert!(!tile_orphan_edges(&model, second_id)[SquareDirection::East.index()]);
     }
 
     #[test]
@@ -2062,14 +1874,14 @@ mod tests {
         let tile_id = tiles.insert(tile);
         let mut model = model_with_square_tiles(tiles, tile_id);
 
-        let health = orphan_edges(&model, tile_id);
+        let health = tile_orphan_edges(&model, tile_id);
         assert!(!health[SquareDirection::North.index()]);
         assert!(!health[SquareDirection::South.index()]);
         assert!(health[SquareDirection::East.index()]);
 
         let variant = model.variants_for_tile(tile_id)[0];
         model.set_variant_enabled(variant, false);
-        assert_eq!(orphan_edges(&model, tile_id), health);
+        assert_eq!(tile_orphan_edges(&model, tile_id), health);
     }
 
     #[test]
@@ -2084,9 +1896,9 @@ mod tests {
         let second_id = tiles.insert(second);
         let mut model = model_with_square_tiles(tiles, first_id);
 
-        assert!(!orphan_edges(&model, first_id)[SquareDirection::North.index()]);
+        assert!(!tile_orphan_edges(&model, first_id)[SquareDirection::North.index()]);
         model.remove_tile(second_id);
-        assert!(orphan_edges(&model, first_id)[SquareDirection::North.index()]);
+        assert!(tile_orphan_edges(&model, first_id)[SquareDirection::North.index()]);
     }
 
     #[test]
@@ -2156,7 +1968,7 @@ mod tests {
         let version = model.catalog_version();
 
         assert_eq!(
-            model.copy_selected_edge(
+            model.copy_selected_square_edge(
                 SquareEdgeRef {
                     tile: source_id,
                     direction: SquareDirection::North,
@@ -2177,9 +1989,9 @@ mod tests {
             model.square.tiles.get(partner_id).unwrap().sockets[SquareDirection::West],
             source_edge.reversed()
         );
-        assert!(!orphan_edges(&model, source_id)[SquareDirection::North.index()]);
+        assert!(!tile_orphan_edges(&model, source_id)[SquareDirection::North.index()]);
         assert_eq!(
-            model.copy_selected_edge(
+            model.copy_selected_square_edge(
                 SquareEdgeRef {
                     tile: source_id,
                     direction: SquareDirection::North,
@@ -2190,7 +2002,7 @@ mod tests {
             EdgeCopyResult::NoChange
         );
         assert_eq!(
-            model.copy_selected_edge(
+            model.copy_selected_square_edge(
                 SquareEdgeRef {
                     tile: source_id,
                     direction: SquareDirection::North,
@@ -2222,7 +2034,7 @@ mod tests {
         let version = model.catalog_version();
 
         assert_eq!(
-            model.copy_selected_edge(
+            model.copy_selected_square_edge(
                 SquareEdgeRef {
                     tile: source_id,
                     direction: SquareDirection::North,
@@ -2568,13 +2380,285 @@ mod tests {
     }
 
     #[test]
-    fn square_edge_assistance_stays_unavailable_in_hex_mode() {
+    fn hex_border_painting_propagates_across_every_direction() {
+        const PAINTED_INDEX: usize = 5;
+        let pattern = hex_patterned_edge(40);
+        let reversed: Vec<_> = pattern.iter().copied().rev().collect();
+
+        // Each case sweeps both sides through all six directions: exact partners
+        // share the direction, reversed partners take the next one clockwise.
+        for (index, source_direction) in HexDirection::ALL.iter().copied().enumerate() {
+            for reverse in [false, true] {
+                let partner_direction = if reverse {
+                    HexDirection::ALL[(index + 1) % HexDirection::ALL.len()]
+                } else {
+                    source_direction
+                };
+                let mut source = hex_tile("Source".to_owned(), [80, 80, 80], [false; 6]);
+                set_hex_edge(&mut source, source_direction, &pattern);
+                let mut partner = hex_tile("Partner".to_owned(), [90, 90, 90], [false; 6]);
+                set_hex_edge(
+                    &mut partner,
+                    partner_direction,
+                    if reverse { &reversed } else { &pattern },
+                );
+                let mut tiles = TileSet::new();
+                let source_id = tiles.insert(source);
+                let partner_id = tiles.insert(partner);
+                let mut model = model_with_hex_tiles(tiles, source_id);
+
+                let color = [250, 10, 130, 255];
+                let painted = HexRaster::edge_sample(source_direction, PAINTED_INDEX);
+                let context =
+                    format!("{source_direction:?} -> {partner_direction:?} reverse={reverse}");
+                assert!(
+                    model.paint_selected_tile(painted, painted, 1, color),
+                    "{context}"
+                );
+
+                let partner_index = if reverse {
+                    HEX_EDGE_SAMPLES - 1 - PAINTED_INDEX
+                } else {
+                    PAINTED_INDEX
+                };
+                let source = model.hex.tiles.get(source_id).unwrap();
+                let partner = model.hex.tiles.get(partner_id).unwrap();
+                assert_eq!(source.payload.raster.get(painted), Some(color), "{context}");
+                assert_eq!(
+                    partner
+                        .payload
+                        .raster
+                        .get(HexRaster::edge_sample(partner_direction, partner_index)),
+                    Some(color),
+                    "{context}",
+                );
+                let partner_edge = &partner.sockets[partner_direction];
+                assert_eq!(
+                    source.sockets[source_direction],
+                    if reverse {
+                        partner_edge.reversed()
+                    } else {
+                        partner_edge.clone()
+                    },
+                    "{context}",
+                );
+                assert!(
+                    !tile_orphan_edges(&model, source_id)[source_direction.index()],
+                    "{context}",
+                );
+                assert!(
+                    !tile_orphan_edges(&model, partner_id)[partner_direction.index()],
+                    "{context}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hex_corner_painting_updates_both_incident_sides_and_their_families() {
         let mut model = EditorModel::default();
         select_hex(&mut model);
-        let before = model.catalog_version();
-        assert!(model.square_orphan_edges().is_empty());
+
+        for (step, corner_direction) in HexDirection::ALL.iter().copied().enumerate() {
+            // Every side starts at a distinct vertex, so this visits all six.
+            let corner = HexRaster::edge_sample(corner_direction, 0);
+            let incident: Vec<_> = HexDirection::ALL
+                .iter()
+                .copied()
+                .flat_map(|direction| {
+                    [0, HEX_EDGE_SAMPLES - 1]
+                        .into_iter()
+                        .filter(move |index| HexRaster::edge_sample(direction, *index) == corner)
+                        .map(move |index| (direction, index))
+                })
+                .collect();
+            assert_eq!(incident.len(), 2, "{corner_direction:?} is not a corner");
+
+            let before: Vec<_> = model
+                .hex
+                .tiles
+                .iter()
+                .flat_map(|(_, tile)| tile.sockets.iter().map(|(_, edge)| edge.clone()))
+                .collect();
+            let color = [200, 40, step as u8 * 30, 255];
+            assert!(model.paint_selected_tile(corner, corner, 1, color));
+
+            let selected = model.hex.tiles.get(TileId::new(0)).unwrap();
+            for (direction, index) in incident {
+                assert_eq!(
+                    selected.sockets[direction].as_slice()[index],
+                    color,
+                    "{direction:?} does not carry the painted corner",
+                );
+            }
+
+            let after: Vec<_> = model
+                .hex
+                .tiles
+                .iter()
+                .flat_map(|(_, tile)| tile.sockets.iter().map(|(_, edge)| edge.clone()))
+                .collect();
+            for left in 0..before.len() {
+                for right in left + 1..before.len() {
+                    let were_linked =
+                        before[left] == before[right] || before[left] == before[right].reversed();
+                    if were_linked {
+                        assert!(
+                            after[left] == after[right] || after[left] == after[right].reversed(),
+                            "corner {corner_direction:?} split a linked family",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn deleting_the_only_partner_marks_a_hex_edge_orphan() {
+        let pattern = hex_patterned_edge(90);
+        let mut first = hex_tile("First".to_owned(), [80, 80, 80], [false; 6]);
+        set_hex_edge(&mut first, HexDirection::NorthEast, &pattern);
+        let mut second = hex_tile("Second".to_owned(), [90, 90, 90], [false; 6]);
+        set_hex_edge(&mut second, HexDirection::SouthWest, &pattern);
+        let mut tiles = TileSet::new();
+        let first_id = tiles.insert(first);
+        let second_id = tiles.insert(second);
+        let mut model = model_with_hex_tiles(tiles, first_id);
+
+        assert!(!tile_orphan_edges(&model, first_id)[HexDirection::NorthEast.index()]);
+        model.remove_tile(second_id);
+        assert!(tile_orphan_edges(&model, first_id)[HexDirection::NorthEast.index()]);
+    }
+
+    #[test]
+    fn hex_orphan_health_ignores_enabled_orientations() {
+        let shared = hex_patterned_edge(70);
+        let unique = hex_patterned_edge(120);
+        let mut tile = hex_tile("Solo".to_owned(), [80, 80, 80], [false; 6]);
+        set_hex_edge(&mut tile, HexDirection::NorthEast, &shared);
+        let reversed: Vec<_> = shared.iter().copied().rev().collect();
+        set_hex_edge(&mut tile, HexDirection::SouthEast, &reversed);
+        set_hex_edge(&mut tile, HexDirection::West, &unique);
+        let mut tiles = TileSet::new();
+        let tile_id = tiles.insert(tile);
+        let mut model = model_with_hex_tiles(tiles, tile_id);
+
+        let health = tile_orphan_edges(&model, tile_id);
+        assert!(!health[HexDirection::NorthEast.index()]);
+        assert!(!health[HexDirection::SouthEast.index()]);
+        assert!(health[HexDirection::West.index()]);
+
+        let variant = model.variants_for_tile(tile_id)[0];
+        model.set_variant_enabled(variant, false);
+        assert_eq!(tile_orphan_edges(&model, tile_id), health);
+    }
+
+    #[test]
+    fn copying_a_hex_edge_repairs_and_preserves_linked_families() {
+        let source_pattern = hex_patterned_edge(30);
+        let target_pattern = hex_patterned_edge(160);
+        let mut source = hex_tile("Source".to_owned(), [80, 80, 80], [false; 6]);
+        set_hex_edge(&mut source, HexDirection::NorthEast, &source_pattern);
+        let mut target = hex_tile("Target".to_owned(), [90, 90, 90], [false; 6]);
+        set_hex_edge(&mut target, HexDirection::East, &target_pattern);
+        let mut partner = hex_tile("Partner".to_owned(), [100, 100, 100], [false; 6]);
+        let reversed_target: Vec<_> = target_pattern.iter().copied().rev().collect();
+        set_hex_edge(&mut partner, HexDirection::West, &reversed_target);
+        let mut tiles = TileSet::new();
+        let source_id = tiles.insert(source);
+        let target_id = tiles.insert(target);
+        let partner_id = tiles.insert(partner);
+        let mut model = model_with_hex_tiles(tiles, target_id);
+        let version = model.catalog_version();
+
+        let source_edge_ref = HexEdgeRef {
+            tile: source_id,
+            direction: HexDirection::NorthEast,
+        };
         assert_eq!(
-            model.copy_selected_edge(
+            model.copy_selected_hex_edge(source_edge_ref, HexDirection::East, false),
+            EdgeCopyResult::Applied
+        );
+        assert_eq!(model.catalog_version(), version.wrapping_add(1));
+        let source_edge =
+            model.hex.tiles.get(source_id).unwrap().sockets[HexDirection::NorthEast].clone();
+        assert_eq!(
+            model.hex.tiles.get(target_id).unwrap().sockets[HexDirection::East],
+            source_edge
+        );
+        assert_eq!(
+            model.hex.tiles.get(partner_id).unwrap().sockets[HexDirection::West],
+            source_edge.reversed()
+        );
+        assert!(!tile_orphan_edges(&model, source_id)[HexDirection::NorthEast.index()]);
+
+        assert_eq!(
+            model.copy_selected_hex_edge(source_edge_ref, HexDirection::East, false),
+            EdgeCopyResult::NoChange
+        );
+        assert_eq!(
+            model.copy_selected_hex_edge(source_edge_ref, HexDirection::SouthEast, true),
+            EdgeCopyResult::Applied
+        );
+        assert_eq!(
+            model.hex.tiles.get(target_id).unwrap().sockets[HexDirection::SouthEast],
+            source_edge.reversed()
+        );
+    }
+
+    #[test]
+    fn conflicting_linked_hex_corner_copy_is_rejected_atomically() {
+        let mut source_pattern = hex_patterned_edge(20);
+        source_pattern[0] = [255, 0, 0, 255];
+        source_pattern[HEX_EDGE_SAMPLES - 1] = [0, 0, 255, 255];
+        let mut source = hex_tile("Source".to_owned(), [80, 80, 80], [false; 6]);
+        set_hex_edge(&mut source, HexDirection::NorthEast, &source_pattern);
+        let target = hex_tile("Target".to_owned(), [90, 90, 90], [false; 6]);
+        let mut tiles = TileSet::new();
+        let source_id = tiles.insert(source);
+        let target_id = tiles.insert(target);
+        let mut model = model_with_hex_tiles(tiles, target_id);
+        let before = model.hex.tiles.clone();
+        let version = model.catalog_version();
+
+        assert_eq!(
+            model.copy_selected_hex_edge(
+                HexEdgeRef {
+                    tile: source_id,
+                    direction: HexDirection::NorthEast,
+                },
+                HexDirection::NorthEast,
+                false,
+            ),
+            EdgeCopyResult::Conflict
+        );
+        assert_eq!(model.hex.tiles, before);
+        assert_eq!(model.catalog_version(), version);
+    }
+
+    #[test]
+    fn edge_assistance_is_scoped_to_the_active_mode() {
+        let mut model = EditorModel::default();
+        let square_tiles = model.square.tiles.clone();
+        let square_version = model.catalog_version();
+        assert_eq!(
+            model.copy_selected_hex_edge(
+                HexEdgeRef {
+                    tile: TileId::new(0),
+                    direction: HexDirection::NorthEast,
+                },
+                HexDirection::SouthWest,
+                false,
+            ),
+            EdgeCopyResult::Invalid
+        );
+        assert_eq!(model.catalog_version(), square_version);
+
+        select_hex(&mut model);
+        let hex_tiles = model.hex.tiles.clone();
+        let hex_version = model.catalog_version();
+        assert_eq!(
+            model.copy_selected_square_edge(
                 SquareEdgeRef {
                     tile: TileId::new(0),
                     direction: SquareDirection::North,
@@ -2584,7 +2668,9 @@ mod tests {
             ),
             EdgeCopyResult::Invalid
         );
-        assert_eq!(model.catalog_version(), before);
+        assert_eq!(model.catalog_version(), hex_version);
+        assert_eq!(model.hex.tiles, hex_tiles);
+        assert_eq!(model.square.tiles, square_tiles);
     }
 
     #[test]

@@ -7,17 +7,18 @@ use eframe::egui::{
     Stroke, StrokeKind, TextureHandle, TextureOptions, Vec2,
 };
 use seamless_tiler::{
-    AxisBoundaries, Boundary, CellId, Coord2, Direction, Extent2, QuarterTurns, SixthTurns,
-    SquareDirection, TileId, WfcStatus,
+    AxisBoundaries, Boundary, CellId, Coord2, Direction, Extent2, HexDirection, QuarterTurns,
+    SixthTurns, SquareDirection, TileId, WfcStatus,
 };
 
 use crate::model::{
-    CanvasTool, CellVisual, DEFAULT_EXTENT, EdgeCopyResult, EditableRaster, EditorModel, GridMode,
-    MAX_DIMENSION, Orientation, SquareEdgeRef,
+    CanvasTool, CellVisual, DEFAULT_EXTENT, EditableRaster, EditorModel, GridMode, MAX_DIMENSION,
+    Orientation, TileStyle,
 };
 use crate::raster::{
     DEFAULT_PAINT_COLOR, EDGE_BACKGROUND, HexRaster, Rgba, SQUARE_RASTER_SIZE, SquareRaster,
 };
+use crate::seams::{EdgeCopyResult, EdgeRef, OrphanEdges};
 
 const DEFAULT_CELL_SIZE: f32 = 52.0;
 const DEFAULT_STEPS_PER_SECOND: f32 = 8.0;
@@ -40,9 +41,16 @@ pub struct TilerApp {
     paint_color: Rgba,
     brush_sizes: [usize; 2],
     paint_stroke: Option<PaintStroke>,
-    edge_copy_source: Option<SquareEdgeRef>,
-    edge_copy_target: SquareDirection,
-    reverse_edge_copy: bool,
+    square_edge_copy: EdgeCopyControls<SquareDirection>,
+    hex_edge_copy: EdgeCopyControls<HexDirection>,
+}
+
+/// One mode's edge assistant selections, kept independent per mode so switching
+/// modes never disturbs the other session's authoring state.
+struct EdgeCopyControls<D> {
+    source: Option<EdgeRef<D>>,
+    target: D,
+    reverse: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -85,9 +93,16 @@ impl Default for TilerApp {
             paint_color: DEFAULT_PAINT_COLOR,
             brush_sizes: [1; 2],
             paint_stroke: None,
-            edge_copy_source: None,
-            edge_copy_target: SquareDirection::North,
-            reverse_edge_copy: false,
+            square_edge_copy: EdgeCopyControls {
+                source: None,
+                target: SquareDirection::North,
+                reverse: false,
+            },
+            hex_edge_copy: EdgeCopyControls {
+                source: None,
+                target: HexDirection::NorthEast,
+                reverse: false,
+            },
         }
     }
 }
@@ -222,7 +237,6 @@ impl TilerApp {
         });
         if self.model.set_mode(mode) {
             self.paint_stroke = None;
-            self.edge_copy_source = None;
             self.dimension_inputs[mode.index()] = self.model.extent();
             self.step_accumulator = 0.0;
             self.last_frame_time = ui.input(|input| input.time);
@@ -238,22 +252,25 @@ impl TilerApp {
             ui.add(egui::DragValue::new(&mut dimensions.height).range(1..=MAX_DIMENSION));
             ui.end_row();
         });
-        ui.horizontal_wrapped(|ui| {
-            if ui.button("Apply size").clicked() {
-                self.model.resize(*dimensions);
-            }
-            if ui.button("Clear pins").clicked() {
-                let cleared = self.model.clear_pins();
-                self.notice = Some(format!("Cleared {cleared} pin(s)"));
-            }
-            if ui.button("Reset mode").clicked() {
-                self.model.reset_active();
-                self.paint_stroke = None;
-                self.edge_copy_source = None;
-                *dimensions = DEFAULT_EXTENT;
-                self.notice = Some(format!("Reset {} mode", mode.label()));
-            }
-        });
+        let reset = ui
+            .horizontal_wrapped(|ui| {
+                if ui.button("Apply size").clicked() {
+                    self.model.resize(*dimensions);
+                }
+                if ui.button("Clear pins").clicked() {
+                    let cleared = self.model.clear_pins();
+                    self.notice = Some(format!("Cleared {cleared} pin(s)"));
+                }
+                ui.button("Reset mode").clicked()
+            })
+            .inner;
+        if reset {
+            self.model.reset_active();
+            self.paint_stroke = None;
+            self.clear_edge_source(mode);
+            self.dimension_inputs[mode.index()] = DEFAULT_EXTENT;
+            self.notice = Some(format!("Reset {} mode", mode.label()));
+        }
         ui.add(egui::Slider::new(&mut self.cell_size, 28.0..=80.0).text("Cell size"));
     }
 
@@ -359,23 +376,21 @@ impl TilerApp {
     fn show_tile_catalog(&mut self, ui: &mut egui::Ui) {
         ui.heading("Tile catalog");
         ui.weak("Select a tile to edit its samples; border samples drive matching.");
-        let orphan_edges = self.model.square_orphan_edges();
-        if self.model.mode() == GridMode::Square {
-            let count = orphan_edges
-                .iter()
-                .map(|(_, edges)| edges.iter().filter(|orphan| **orphan).count())
-                .sum::<usize>();
-            if count == 0 {
-                ui.colored_label(
-                    Color32::from_rgb(100, 220, 130),
-                    "All tile edges have partners",
-                );
-            } else {
-                ui.colored_label(
-                    Color32::from_rgb(255, 105, 105),
-                    format!("{count} orphan edge(s) need a matching partner"),
-                );
-            }
+        let orphan_edges = self.model.orphan_edges();
+        let count = orphan_edges
+            .iter()
+            .map(|(_, edges)| orphan_count(*edges))
+            .sum::<usize>();
+        if count == 0 {
+            ui.colored_label(
+                Color32::from_rgb(100, 220, 130),
+                "All tile edges have partners",
+            );
+        } else {
+            ui.colored_label(
+                Color32::from_rgb(255, 105, 105),
+                format!("{count} orphan edge(s) need a matching partner"),
+            );
         }
         let mut pending_delete: Option<(TileId, String)> = None;
         for (tile_id, style) in self.model.tiles() {
@@ -404,7 +419,7 @@ impl TilerApp {
                     pending_delete = Some((tile_id, style.name.clone()));
                 }
                 if let Some(edges) = tile_orphans {
-                    let count = edges.iter().filter(|orphan| **orphan).count();
+                    let count = orphan_count(edges);
                     if count > 0 {
                         ui.colored_label(
                             Color32::from_rgb(255, 105, 105),
@@ -417,7 +432,7 @@ impl TilerApp {
         if let Some((tile_id, name)) = pending_delete {
             self.model.remove_tile(tile_id);
             self.paint_stroke = None;
-            self.edge_copy_source = None;
+            self.clear_edge_source(self.model.mode());
             self.notice = Some(format!("Deleted {name}"));
         }
         ui.add_space(4.0);
@@ -463,13 +478,8 @@ impl TilerApp {
     fn show_square_editor(&mut self, ui: &mut egui::Ui, tile_id: TileId) {
         ui.weak("Linked border painting is active; matching and reversed edges update together.");
 
-        let orphan_edges = self
-            .model
-            .square_orphan_edges()
-            .into_iter()
-            .find_map(|(candidate, edges)| (candidate == tile_id).then_some(edges))
-            .unwrap_or([false; 4]);
-        self.show_edge_assistant(ui, orphan_edges);
+        let orphan_edges = self.tile_orphan_edges(tile_id);
+        self.show_square_edge_assistant(ui, orphan_edges);
 
         let editor_size = Vec2::splat(SQUARE_RASTER_SIZE as f32 * EDITOR_PIXEL_SIZE);
         let (response, painter) = ui.allocate_painter(editor_size, Sense::drag());
@@ -490,7 +500,10 @@ impl TilerApp {
     }
 
     fn show_hex_editor(&mut self, ui: &mut egui::Ui, tile_id: TileId) {
-        ui.weak("Each stroke re-extracts all six sides; partner edges do not follow yet.");
+        ui.weak("Linked border painting is active; matching and reversed edges update together.");
+
+        let orphan_edges = self.tile_orphan_edges(tile_id);
+        self.show_hex_edge_assistant(ui, orphan_edges);
 
         let (response, painter) = ui.allocate_painter(hex_editor_size(), Sense::drag());
         let hovered = self.drive_paint_stroke(ui, &response, tile_id, hex_editor_sample);
@@ -508,10 +521,12 @@ impl TilerApp {
                 Color32::WHITE,
             );
         }
+        let polygon = regular_hex_points(response.rect.center(), response.rect.height() * 0.5);
         painter.add(Shape::closed_line(
-            regular_hex_points(response.rect.center(), response.rect.height() * 0.5).to_vec(),
+            polygon.to_vec(),
             Stroke::new(1.0, Color32::from_gray(130)),
         ));
+        paint_hex_orphan_edges(&painter, polygon, orphan_edges);
         if let Some(sample) = hovered {
             paint_hex_brush_preview(
                 &painter,
@@ -615,98 +630,67 @@ impl TilerApp {
         });
     }
 
-    fn show_edge_assistant(&mut self, ui: &mut egui::Ui, orphan_edges: [bool; 4]) {
-        ui.add_space(4.0);
-        ui.label(RichText::new("Edge assistant").strong());
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Selected edge status:");
-            for direction in SquareDirection::ALL.iter().copied() {
-                let orphan = orphan_edges[direction.index()];
-                ui.colored_label(
-                    if orphan {
-                        Color32::from_rgb(255, 105, 105)
-                    } else {
-                        Color32::from_rgb(100, 220, 130)
-                    },
-                    format!(
-                        "{} {}",
-                        square_direction_label(direction),
-                        if orphan { "orphan" } else { "linked" }
-                    ),
-                );
-            }
-        });
+    /// Per-side orphan flags for one tile of the active mode.
+    fn tile_orphan_edges(&self, tile: TileId) -> OrphanEdges {
+        self.model
+            .orphan_edges()
+            .into_iter()
+            .find_map(|(candidate, edges)| (candidate == tile).then_some(edges))
+            .unwrap_or_default()
+    }
 
-        let tiles = self.model.tiles();
-        if self
-            .edge_copy_source
-            .is_some_and(|source| !tiles.iter().any(|(tile, _)| *tile == source.tile))
-        {
-            self.edge_copy_source = None;
+    /// Drops one mode's source selection after its catalog changed underneath it.
+    fn clear_edge_source(&mut self, mode: GridMode) {
+        match mode {
+            GridMode::Square => self.square_edge_copy.source = None,
+            GridMode::Hex => self.hex_edge_copy.source = None,
         }
-        let selected_source = self
-            .edge_copy_source
-            .and_then(|source| {
-                tiles
-                    .iter()
-                    .find(|(tile, _)| *tile == source.tile)
-                    .map(|(_, style)| edge_source_label(&style.name, source.direction))
-            })
-            .unwrap_or_else(|| "Choose an edge".to_owned());
+    }
 
-        ui.horizontal(|ui| {
-            ui.label("Source");
-            egui::ComboBox::from_id_salt("edge-copy-source")
-                .selected_text(selected_source)
-                .show_ui(ui, |ui| {
-                    for (tile, style) in &tiles {
-                        for direction in SquareDirection::ALL.iter().copied() {
-                            let source = SquareEdgeRef {
-                                tile: *tile,
-                                direction,
-                            };
-                            ui.selectable_value(
-                                &mut self.edge_copy_source,
-                                Some(source),
-                                edge_source_label(&style.name, direction),
-                            );
-                        }
-                    }
-                });
-        });
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Target");
-            for direction in SquareDirection::ALL.iter().copied() {
-                ui.selectable_value(
-                    &mut self.edge_copy_target,
-                    direction,
-                    square_direction_label(direction),
-                );
+    fn show_square_edge_assistant(&mut self, ui: &mut egui::Ui, orphan_edges: OrphanEdges) {
+        let tiles = self.model.tiles();
+        let request = edge_assistant_controls(
+            ui,
+            &tiles,
+            orphan_edges,
+            &mut self.square_edge_copy,
+            square_direction_label,
+        );
+        if let Some((source, target, reverse)) = request {
+            let result = self
+                .model
+                .copy_selected_square_edge(source, target, reverse);
+            self.report_edge_copy(ui, result);
+        }
+    }
+
+    fn show_hex_edge_assistant(&mut self, ui: &mut egui::Ui, orphan_edges: OrphanEdges) {
+        let tiles = self.model.tiles();
+        let request = edge_assistant_controls(
+            ui,
+            &tiles,
+            orphan_edges,
+            &mut self.hex_edge_copy,
+            hex_direction_label,
+        );
+        if let Some((source, target, reverse)) = request {
+            let result = self.model.copy_selected_hex_edge(source, target, reverse);
+            self.report_edge_copy(ui, result);
+        }
+    }
+
+    fn report_edge_copy(&mut self, ui: &egui::Ui, result: EdgeCopyResult) {
+        self.notice = Some(match result {
+            EdgeCopyResult::Applied => "Copied edge and updated its linked family".to_owned(),
+            EdgeCopyResult::NoChange => "Target edge already matches the source".to_owned(),
+            EdgeCopyResult::Conflict => {
+                "Copy would assign conflicting linked corner colors".to_owned()
             }
-            ui.checkbox(&mut self.reverse_edge_copy, "Reverse");
-            let copy = ui.add_enabled(self.edge_copy_source.is_some(), egui::Button::new("Copy"));
-            if copy.clicked() {
-                let result = self.model.copy_selected_edge(
-                    self.edge_copy_source
-                        .expect("copy button requires a source edge"),
-                    self.edge_copy_target,
-                    self.reverse_edge_copy,
-                );
-                self.notice = Some(match result {
-                    EdgeCopyResult::Applied => {
-                        "Copied edge and updated its linked family".to_owned()
-                    }
-                    EdgeCopyResult::NoChange => "Target edge already matches the source".to_owned(),
-                    EdgeCopyResult::Conflict => {
-                        "Copy would assign conflicting linked corner colors".to_owned()
-                    }
-                    EdgeCopyResult::Invalid => "Choose a valid source and target edge".to_owned(),
-                });
-                if result == EdgeCopyResult::Applied {
-                    ui.ctx().request_repaint();
-                }
-            }
+            EdgeCopyResult::Invalid => "Choose a valid source and target edge".to_owned(),
         });
+        if result == EdgeCopyResult::Applied {
+            ui.ctx().request_repaint();
+        }
     }
 
     fn show_variant_palette(&mut self, ui: &mut egui::Ui) {
@@ -1213,7 +1197,114 @@ fn paint_raster_editor(painter: &egui::Painter, canvas: Rect, raster: &SquareRas
     );
 }
 
-fn paint_orphan_edges(painter: &egui::Painter, canvas: Rect, orphan_edges: [bool; 4]) {
+/// Draws the shared edge assistant: per-side health, a catalog-wide source
+/// picker, and the target and reversal controls.
+///
+/// Returns the requested copy so the caller can route it to the matching mode,
+/// which keeps the model borrow separate from the control state borrow.
+fn edge_assistant_controls<D: Direction>(
+    ui: &mut egui::Ui,
+    tiles: &[(TileId, TileStyle)],
+    orphan_edges: OrphanEdges,
+    controls: &mut EdgeCopyControls<D>,
+    label: fn(D) -> &'static str,
+) -> Option<(EdgeRef<D>, D, bool)> {
+    ui.add_space(4.0);
+    ui.label(RichText::new("Edge assistant").strong());
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Selected edge status:");
+        for direction in D::ALL.iter().copied() {
+            let orphan = orphan_edges[direction.index()];
+            ui.colored_label(
+                if orphan {
+                    Color32::from_rgb(255, 105, 105)
+                } else {
+                    Color32::from_rgb(100, 220, 130)
+                },
+                format!(
+                    "{} {}",
+                    label(direction),
+                    if orphan { "orphan" } else { "linked" }
+                ),
+            );
+        }
+    });
+
+    if controls
+        .source
+        .is_some_and(|source| !tiles.iter().any(|(tile, _)| *tile == source.tile))
+    {
+        controls.source = None;
+    }
+    let selected_source = controls
+        .source
+        .and_then(|source| {
+            tiles
+                .iter()
+                .find(|(tile, _)| *tile == source.tile)
+                .map(|(_, style)| edge_source_label(&style.name, label(source.direction)))
+        })
+        .unwrap_or_else(|| "Choose an edge".to_owned());
+
+    ui.horizontal(|ui| {
+        ui.label("Source");
+        egui::ComboBox::from_id_salt("edge-copy-source")
+            .selected_text(selected_source)
+            .show_ui(ui, |ui| {
+                for (tile, style) in tiles {
+                    for direction in D::ALL.iter().copied() {
+                        let source = EdgeRef {
+                            tile: *tile,
+                            direction,
+                        };
+                        ui.selectable_value(
+                            &mut controls.source,
+                            Some(source),
+                            edge_source_label(&style.name, label(direction)),
+                        );
+                    }
+                }
+            });
+    });
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Target");
+        for direction in D::ALL.iter().copied() {
+            ui.selectable_value(&mut controls.target, direction, label(direction));
+        }
+        ui.checkbox(&mut controls.reverse, "Reverse");
+        let copy = ui.add_enabled(controls.source.is_some(), egui::Button::new("Copy"));
+        copy.clicked()
+            .then(|| {
+                controls
+                    .source
+                    .map(|source| (source, controls.target, controls.reverse))
+            })
+            .flatten()
+    })
+    .inner
+}
+
+/// Counts the sides of one tile that have no partner to match.
+fn orphan_count(orphan_edges: OrphanEdges) -> usize {
+    orphan_edges.iter().filter(|orphan| **orphan).count()
+}
+
+/// Outlines the orphaned sides of the hex editor polygon.
+///
+/// Polygon vertex `index` starts the side facing `HexDirection::ALL[index]`,
+/// because `regular_hex_points` walks clockwise from the top vertex.
+fn paint_hex_orphan_edges(painter: &egui::Painter, polygon: [Pos2; 6], orphan_edges: OrphanEdges) {
+    let stroke = Stroke::new(4.0, Color32::from_rgb(255, 75, 75));
+    for direction in HexDirection::ALL.iter().copied() {
+        if !orphan_edges[direction.index()] {
+            continue;
+        }
+        let index = direction.index();
+        painter.line_segment([polygon[index], polygon[(index + 1) % 6]], stroke);
+    }
+}
+
+fn paint_orphan_edges(painter: &egui::Painter, canvas: Rect, orphan_edges: OrphanEdges) {
     let stroke = Stroke::new(4.0, Color32::from_rgb(255, 75, 75));
     let inset = 2.0;
     for direction in SquareDirection::ALL.iter().copied() {
@@ -1314,8 +1405,19 @@ fn square_direction_label(direction: SquareDirection) -> &'static str {
     }
 }
 
-fn edge_source_label(name: &str, direction: SquareDirection) -> String {
-    format!("{name} · {}", square_direction_label(direction))
+fn hex_direction_label(direction: HexDirection) -> &'static str {
+    match direction {
+        HexDirection::NorthEast => "NE",
+        HexDirection::East => "E",
+        HexDirection::SouthEast => "SE",
+        HexDirection::SouthWest => "SW",
+        HexDirection::West => "W",
+        HexDirection::NorthWest => "NW",
+    }
+}
+
+fn edge_source_label(name: &str, direction: &str) -> String {
+    format!("{name} · {direction}")
 }
 
 fn style_color(color: [u8; 3]) -> Color32 {
@@ -1567,6 +1669,51 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// The orphan overlay assumes polygon side `index` faces
+    /// `HexDirection::ALL[index]`; check that against the editor's own pointer
+    /// mapping so a change to either geometry cannot silently mislabel a side.
+    ///
+    /// The drawn polygon touches the canvas bounds while the exported image's
+    /// outermost sample centers sit half a texel inside, so a side's midpoint
+    /// probe lands next to that side rather than exactly on it. Nearness is what
+    /// the overlay needs, so the assertion compares distances instead.
+    #[test]
+    fn hex_polygon_sides_face_their_direction() {
+        let canvas = Rect::from_min_size(Pos2::new(10.0, 20.0), hex_editor_size());
+        let polygon = regular_hex_points(canvas.center(), canvas.height() * 0.5);
+        let distance = |left: Coord2, right: Coord2| {
+            let dq = left.x - right.x;
+            let dr = left.y - right.y;
+            (dq.abs() + dr.abs() + (dq + dr).abs()) / 2
+        };
+        let distance_to_side = |sample: Coord2, side: HexDirection| {
+            HexRaster::edge_coordinates(side)
+                .into_iter()
+                .map(|coord| distance(sample, coord))
+                .min()
+                .expect("every side has samples")
+        };
+
+        for (index, direction) in HexDirection::ALL.iter().copied().enumerate() {
+            let midpoint = polygon[index] + (polygon[(index + 1) % 6] - polygon[index]) * 0.5;
+            let probe = midpoint + (canvas.center() - midpoint).normalized() * 4.0;
+            let sample = hex_editor_sample(canvas, probe)
+                .unwrap_or_else(|| panic!("side {index} probe fell outside the hex"));
+
+            let nearest = distance_to_side(sample, direction);
+            for other in HexDirection::ALL
+                .iter()
+                .copied()
+                .filter(|d| *d != direction)
+            {
+                assert!(
+                    distance_to_side(sample, other) > nearest,
+                    "polygon side {index} is not closest to {direction:?}",
+                );
+            }
+        }
     }
 
     #[test]

@@ -16,10 +16,13 @@ types from focused private modules:
   constraint propagation over generic topologies.
 
 The `ui/` workspace member is the native `seamless_tiler_ui` binary. Its
-`src/main.rs` configures eframe with the wgpu renderer, `src/model.rs` owns the
-independent session-only square and hex WFC configurations and tile adapters,
-and `src/app.rs` owns egui controls, mode-aware geometry, hit testing, and canvas
-painting.
+`src/main.rs` configures eframe with the wgpu renderer, `src/raster.rs` owns the
+square and hex sample surfaces behind the shared `TileSurface` shape contract,
+`src/seams.rs` owns shape-independent seamlessness assistance (reversal-aware
+edge families, sample link components, orphan detection, and atomic edge copy
+planning), `src/model.rs` owns the independent session-only square and hex WFC
+configurations and tile adapters, and `src/app.rs` owns egui controls,
+mode-aware geometry, hit testing, and canvas painting.
 
 Unit tests live beside their implementation in `#[cfg(test)]` modules. Crate-level
 examples are doctests in `src/lib.rs`. There are currently no runtime assets;
