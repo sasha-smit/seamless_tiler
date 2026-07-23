@@ -26,7 +26,9 @@ mod contact_sheet;
 
 const DEFAULT_CELL_SIZE: f32 = 52.0;
 const DEFAULT_STEPS_PER_SECOND: f32 = 8.0;
+const DEFAULT_CONTROLS_WIDTH: f32 = 300.0;
 const EDITOR_PIXEL_SIZE: f32 = 8.0;
+const VARIANT_CARD_WIDTH: f32 = 80.0;
 const MAX_BRUSH_SIZE: usize = 8;
 const MAX_HEX_BRUSH_SIZE: usize = 6;
 const HEX_EDITOR_HEIGHT: f32 = 288.0;
@@ -136,15 +138,26 @@ impl eframe::App for TilerApp {
             });
         });
 
-        egui::Panel::left("controls")
-            .default_size(300.0)
-            .resizable(true)
-            .show(ui, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| self.show_controls(ui));
-            });
+        show_controls_panel(ui, |ui| self.show_controls(ui));
 
         egui::CentralPanel::default().show(ui, |ui| self.show_canvas(ui));
     }
+}
+
+/// Shows controls at the persisted user-selected width.
+///
+/// Horizontal scrolling keeps wide or newly added content from becoming a
+/// sizing request for the panel. Filling both axes keeps the scroll area at the
+/// panel's current size, while the panel's resize handle remains authoritative.
+fn show_controls_panel<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui) -> R) {
+    let _ = egui::Panel::left("controls")
+        .default_size(DEFAULT_CONTROLS_WIDTH)
+        .resizable(true)
+        .show(ui, |ui| {
+            let _ = egui::ScrollArea::both()
+                .auto_shrink([false, false])
+                .show(ui, add_contents);
+        });
 }
 
 impl TilerApp {
@@ -761,36 +774,47 @@ impl TilerApp {
                     .strong()
                     .color(style_color(style.color)),
             );
-            ui.horizontal_wrapped(|ui| {
-                for variant_index in variant_indices {
-                    let mut enabled = self.model.variant_enabled(variant_index);
-                    ui.vertical(|ui| {
-                        if ui.checkbox(&mut enabled, "Allowed").changed() {
-                            let cleared = self.model.set_variant_enabled(variant_index, enabled);
-                            if cleared > 0 {
-                                self.notice = Some(format!(
-                                    "Disabled orientation and cleared {cleared} matching pin(s)"
-                                ));
-                            }
-                        }
-                        let response = self.paint_variant_preview(ui, variant_index, enabled);
-                        if response.clicked() && enabled {
-                            self.model.set_tool(CanvasTool::Pin(variant_index));
-                        }
-                        let orientation = self
-                            .model
-                            .variant(variant_index)
-                            .expect("palette contains catalog variants")
-                            .orientation;
-                        ui.label(RichText::new(orientation_label(orientation)).small());
-                    });
-                }
-            });
+            let cards_per_row =
+                variant_cards_per_row(ui.available_width(), ui.spacing().item_spacing.x);
+            for row in variant_indices.chunks(cards_per_row) {
+                show_variant_row(ui, |ui| {
+                    for variant_index in row.iter().copied() {
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(VARIANT_CARD_WIDTH, 0.0),
+                            egui::Layout::top_down(egui::Align::Center),
+                            |ui| self.show_variant_card(ui, variant_index),
+                        );
+                    }
+                });
+            }
         }
         ui.weak(format!(
             "{} distinct orientations enabled",
             self.model.enabled_variant_count()
         ));
+    }
+
+    fn show_variant_card(&mut self, ui: &mut egui::Ui, variant_index: usize) {
+        ui.set_width(VARIANT_CARD_WIDTH);
+        let mut enabled = self.model.variant_enabled(variant_index);
+        if ui.checkbox(&mut enabled, "Allowed").changed() {
+            let cleared = self.model.set_variant_enabled(variant_index, enabled);
+            if cleared > 0 {
+                self.notice = Some(format!(
+                    "Disabled orientation and cleared {cleared} matching pin(s)"
+                ));
+            }
+        }
+        let response = self.paint_variant_preview(ui, variant_index, enabled);
+        if response.clicked() && enabled {
+            self.model.set_tool(CanvasTool::Pin(variant_index));
+        }
+        let orientation = self
+            .model
+            .variant(variant_index)
+            .expect("palette contains catalog variants")
+            .orientation;
+        ui.add(egui::Label::new(RichText::new(orientation_label(orientation)).small()).wrap());
     }
 
     fn paint_variant_preview(
@@ -1178,6 +1202,19 @@ fn hex_editor_sample(canvas: Rect, pointer: Pos2) -> Option<Coord2> {
         (local.x / canvas.width() * width as f32).floor() as i32,
         (local.y / canvas.height() * height as f32).floor() as i32,
     )
+}
+
+fn variant_cards_per_row(available_width: f32, spacing: f32) -> usize {
+    ((available_width + spacing) / (VARIANT_CARD_WIDTH + spacing))
+        .floor()
+        .max(1.0) as usize
+}
+
+fn show_variant_row<R>(
+    ui: &mut egui::Ui,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<R> {
+    ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), add_contents)
 }
 
 fn hex_texel_rect(canvas: Rect, x: i32, y: i32) -> Rect {
@@ -1734,6 +1771,88 @@ mod tests {
     use super::*;
     use crate::raster::TileSurface;
     use seamless_tiler::{D4, D6};
+
+    fn controls_width_after_frame(context: &egui::Context, content_width: f32) -> f32 {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1_000.0, 700.0))),
+            ..Default::default()
+        };
+        let _ = context.run_ui(input, |ui| {
+            show_controls_panel(ui, |ui| {
+                ui.allocate_space(Vec2::new(content_width, 20.0));
+            });
+            egui::CentralPanel::default().show(ui, |_| {});
+        });
+        egui::PanelState::load(context, egui::Id::new("controls"))
+            .expect("controls panel state should be persisted")
+            .size()
+            .x
+    }
+
+    #[test]
+    fn controls_panel_width_ignores_content_growth() {
+        let context = egui::Context::default();
+        let initial = controls_width_after_frame(&context, 100.0);
+        let user_width = 420.0;
+        context.data_mut(|data| {
+            data.insert_persisted(
+                egui::Id::new("controls"),
+                egui::PanelState {
+                    outer_rect: Rect::from_min_size(Pos2::ZERO, Vec2::new(user_width, 700.0)),
+                },
+            );
+        });
+        let after_wide_content = controls_width_after_frame(&context, 1_000.0);
+        let after_narrow_content = controls_width_after_frame(&context, 20.0);
+
+        assert_eq!(initial, DEFAULT_CONTROLS_WIDTH);
+        assert_eq!(after_wide_content, user_width);
+        assert_eq!(after_narrow_content, user_width);
+    }
+
+    #[test]
+    fn variant_cards_wrap_into_rows_at_the_available_width() {
+        let spacing = 8.0;
+        let narrow_columns = variant_cards_per_row(260.0, spacing);
+        let wide_columns = variant_cards_per_row(440.0, spacing);
+
+        assert_eq!(narrow_columns, 3);
+        assert_eq!(12_usize.div_ceil(narrow_columns), 4);
+        assert_eq!(wide_columns, 5);
+        assert_eq!(12_usize.div_ceil(wide_columns), 3);
+        assert_eq!(variant_cards_per_row(40.0, spacing), 1);
+    }
+
+    #[test]
+    fn variant_rows_top_align_cards_with_different_heights() {
+        let context = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(500.0, 300.0))),
+            ..Default::default()
+        };
+        let mut tops = None;
+        let _ = context.run_ui(input, |ui| {
+            tops = Some(
+                show_variant_row(ui, |ui| {
+                    [70.0, 100.0, 85.0].map(|height| {
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(VARIANT_CARD_WIDTH, height),
+                            egui::Layout::top_down(egui::Align::Center),
+                            |ui| ui.set_min_height(height),
+                        )
+                        .response
+                        .rect
+                        .top()
+                    })
+                })
+                .inner,
+            );
+        });
+
+        let [first, second, third] = tops.expect("variant row should be shown");
+        assert_eq!(first, second);
+        assert_eq!(second, third);
+    }
 
     #[test]
     fn square_pointer_coordinates_respect_canvas_bounds() {
